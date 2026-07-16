@@ -1,0 +1,35 @@
+name: OnDeviceCaptionKit Tests
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+    tags:
+      - '*'
+
+jobs:
+  macos-spm-tests:
+    name: macos-spm-tests
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Run Swift Package tests with coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          swift test --enable-code-coverage 2>&1 | tee artifacts/macos-swift-test.log
+          COVERAGE_JSON_PATH="$(swift test --show-code-coverage-path)"
+          if [[ -f "$COVERAGE_JSON_PATH" ]]; then
+            cp "$COVERAGE_JSON_PATH" artifacts/OnDeviceCaptionKit.json
+          else
+            echo "{}" > artifacts/OnDeviceCaptionKit.json
+          fi
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: macos-spm-artifacts
+          path: artifacts
