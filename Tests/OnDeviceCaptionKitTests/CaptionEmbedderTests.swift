@@ -359,127 +359,31 @@ struct CaptionEmbedderTests {
         shortAudioChunkCount: Int,
         fullAudioChunkCount: Int
     ) async throws -> URL {
-        let outputURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("CaptionEmbedderTests-twoAudio-\(UUID().uuidString)")
-            .appendingPathExtension("mov")
-        try? FileManager.default.removeItem(at: outputURL)
-
-        let frameRate: Int32 = 30
-        let sampleRate = 44_100.0
-        let framesPerChunk = Int(sampleRate) / Int(frameRate)
-
-        let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
-        let videoInput = AVAssetWriterInput(
-            mediaType: .video,
-            outputSettings: [
-                AVVideoCodecKey: AVVideoCodecType.h264,
-                AVVideoWidthKey: 16,
-                AVVideoHeightKey: 16
-            ]
+        let videoDurationSeconds = max(1, Int(ceil(Double(videoFrameCount) * videoFrameSpacingSeconds)))
+        let videoURL = try await makeTinyMOV(
+            includeAudio: false,
+            durationSeconds: videoDurationSeconds
         )
-        videoInput.expectsMediaDataInRealTime = false
-        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
-            assetWriterInput: videoInput,
-            sourcePixelBufferAttributes: [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-                kCVPixelBufferWidthKey as String: 16,
-                kCVPixelBufferHeightKey as String: 16
-            ]
-        )
-        guard writer.canAdd(videoInput) else { throw CaptionEmbeddingTestError.cannotAddVideoInput }
-        writer.add(videoInput)
+        defer { try? FileManager.default.removeItem(at: videoURL) }
 
-        func makeAudioInput() throws -> AVAssetWriterInput {
-            let input = AVAssetWriterInput(
-                mediaType: .audio,
-                outputSettings: [
-                    AVFormatIDKey: kAudioFormatMPEG4AAC,
-                    AVNumberOfChannelsKey: 1,
-                    AVSampleRateKey: sampleRate,
-                    AVEncoderBitRateKey: 64_000
-                ]
-            )
-            input.expectsMediaDataInRealTime = false
-            guard writer.canAdd(input) else { throw CaptionEmbeddingTestError.cannotAddAudioInput }
-            writer.add(input)
-            return input
-        }
+        let shortAudioURL = try await makeAudioOnlyM4A(chunkCount: shortAudioChunkCount)
+        defer { try? FileManager.default.removeItem(at: shortAudioURL) }
+        let partialMuxedURL = try await muxExportSessionVideo(videoURL: videoURL, micAudioURL: shortAudioURL)
+        defer { try? FileManager.default.removeItem(at: partialMuxedURL) }
 
-        let shortAudioInput = try makeAudioInput()
-        let fullAudioInput = try makeAudioInput()
-
-        guard writer.startWriting() else {
-            throw writer.error ?? CaptionEmbeddingTestError.cannotStartWriter
-        }
-        writer.startSession(atSourceTime: .zero)
-
-        let pixelBuffer = try makePixelBuffer(width: 16, height: 16)
-
-        func appendAudio(_ input: AVAssetWriterInput, chunk: Int) async throws {
-            let time = CMTime(
-                value: CMTimeValue(chunk * framesPerChunk),
-                timescale: CMTimeScale(sampleRate)
-            )
-            let buffer = try makeSilentAudioSampleBuffer(
-                presentationTime: time,
-                sampleRate: sampleRate,
-                frameCount: framesPerChunk
-            )
-            try await waitUntilReady(input)
-            guard input.isReadyForMoreMediaData, input.append(buffer) else {
-                writer.cancelWriting()
-                throw writer.error ?? CaptionEmbeddingTestError.cannotAppendFrame
-            }
-        }
-
-        // Audio is dense (30 chunks/second); video is sparse (one frame every
-        // `videoFrameSpacingSeconds`). Interleave both by presentation time so the
-        // writer keeps every input ready, mirroring a near-static screen recording.
-        let chunkDuration = Double(framesPerChunk) / sampleRate
-        let totalChunks = max(shortAudioChunkCount, fullAudioChunkCount)
-        var nextVideoFrame = 0
-        for index in 0..<totalChunks {
-            let chunkTime = Double(index) * chunkDuration
-            while nextVideoFrame < videoFrameCount,
-                  Double(nextVideoFrame) * videoFrameSpacingSeconds <= chunkTime {
-                let videoTime = CMTime(seconds: Double(nextVideoFrame) * videoFrameSpacingSeconds, preferredTimescale: 600)
-                try await waitUntilReady(videoInput)
-                guard videoInput.isReadyForMoreMediaData,
-                      adaptor.append(pixelBuffer, withPresentationTime: videoTime) else {
-                    writer.cancelWriting()
-                    throw writer.error ?? CaptionEmbeddingTestError.cannotAppendFrame
-                }
-                nextVideoFrame += 1
-                if nextVideoFrame == videoFrameCount { videoInput.markAsFinished() }
-            }
-
-            if index < shortAudioChunkCount {
-                try await appendAudio(shortAudioInput, chunk: index)
-                if index == shortAudioChunkCount - 1 { shortAudioInput.markAsFinished() }
-            }
-
-            if index < fullAudioChunkCount {
-                try await appendAudio(fullAudioInput, chunk: index)
-                if index == fullAudioChunkCount - 1 { fullAudioInput.markAsFinished() }
-            }
-        }
-        if nextVideoFrame < videoFrameCount { videoInput.markAsFinished() }
-
-        await finishWriting(writer)
-        guard writer.status == .completed else {
-            throw writer.error ?? CaptionEmbeddingTestError.writerFailed
-        }
-        return outputURL
+        let fullAudioURL = try await makeAudioOnlyM4A(chunkCount: fullAudioChunkCount)
+        defer { try? FileManager.default.removeItem(at: fullAudioURL) }
+        return try await muxExportSessionVideo(videoURL: partialMuxedURL, micAudioURL: fullAudioURL)
     }
 
-    private func makeAudioOnlyM4A() async throws -> URL {
+    private func makeAudioOnlyM4A(chunkCount: Int = 30) async throws -> URL {
         let outputURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("CaptionEmbedderTests-mic-\(UUID().uuidString)")
             .appendingPathExtension("m4a")
         try? FileManager.default.removeItem(at: outputURL)
 
         let sampleRate = 44_100.0
-        let chunks = 30
+        let chunks = max(1, chunkCount)
         let framesPerChunk = Int(sampleRate) / 30
 
         let writer = try AVAssetWriter(outputURL: outputURL, fileType: .m4a)

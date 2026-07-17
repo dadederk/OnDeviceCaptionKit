@@ -1,5 +1,9 @@
 # OnDeviceCaptionKit
 
+<p align="center">
+  <img src="images/OnDeviceCaptionKit.png" alt="OnDeviceCaptionKit logo" width="420">
+</p>
+
 [![Swift](https://img.shields.io/badge/swift-6.2%2B-F05138.svg)](https://swift.org)
 ![Platforms](https://img.shields.io/badge/platform-macOS%2026%2B-0A84FF.svg)
 [![CI](https://github.com/dadederk/OnDeviceCaptionKit/actions/workflows/ondevicecaptionkit-tests.yml/badge.svg)](https://github.com/dadederk/OnDeviceCaptionKit/actions/workflows/ondevicecaptionkit-tests.yml)
@@ -47,6 +51,10 @@ target(
 
 ## Quick Start
 
+OnDeviceCaptionKit is built around three common tasks: transcribe audio, write SRT, and embed captions into a MOV.
+
+Transcribe audio on device:
+
 ```swift
 import Foundation
 import OnDeviceCaptionKit
@@ -60,16 +68,25 @@ let pipeline = CaptionPipeline(
 )
 
 let result = try await pipeline.transcribe(from: audioURL)
+let segments = result.segments
+```
+
+Write an SRT file:
+
+```swift
+try pipeline.writeSRT(segments: segments, besideVideoAt: savedVideoURL)
+```
+
+Embed closed captions in a MOV:
+
+```swift
 let export = try await pipeline.exportCaptions(
-    segments: result.segments,
+    segments: segments,
     videoURL: videoURL,
     format: .embeddedMovCaptions
 )
 
-// SRT sidecar output is deferred until the host app knows the final video path.
-if let deferred = export.deferredSRTSegments {
-    try pipeline.writeSRT(segments: deferred, besideVideoAt: savedVideoURL)
-}
+let captionedVideoURL = export.videoURL
 ```
 
 Asset consent example:
