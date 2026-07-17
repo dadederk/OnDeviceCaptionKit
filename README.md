@@ -129,6 +129,10 @@ if let requirement = await CaptionPipelineCapabilities.requiresAssetDownload(for
 - If MOV embedding fails after transcription succeeds, `CaptionExportResult` preserves the original video URL and returns deferred SRT segments so the host app can offer a fallback file.
 - SRT output is UTF-8, uses `HH:MM:SS,mmm` timestamps, and avoids an extra trailing blank separator.
 
+## Architecture
+
+For a diagram-first view of provider selection, speech asset preparation, SRT writing, MOV embedding, and fallback behavior, see [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Apps Using OnDeviceCaptionKit
 
 - [Mestre!](https://accessibilityupto11.com/apps/mestre/) - macOS screen recorder with optional embedded captions and SRT export.
@@ -161,6 +165,10 @@ Deterministic tests use local AVFoundation fixtures and stubbed muxers. CI tests
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md) for release history and breaking-change notes.
+
+## Support
+
+See [SUPPORT.md](SUPPORT.md) for issue-reporting guidance and package support boundaries.
 
 ## Contributing
 
