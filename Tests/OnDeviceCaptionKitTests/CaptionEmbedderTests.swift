@@ -130,6 +130,28 @@ struct CaptionEmbedderTests {
         #expect(ranges.map { $0.count } == [3, 4])
     }
 
+    @Test("Preferred gap splits never overflow the final caption movie")
+    func givenTwelveCaptionsWithEarlyGapsWhenChunkingThenEveryMovieKeepsTheFourCaptionLimit() {
+        let starts: [TimeInterval] = [0, 1, 2, 4, 5, 6, 8, 9, 10, 11, 12, 13]
+        let captions = starts.map { start in
+            AVCaption(
+                "x",
+                timeRange: CMTimeRange(
+                    start: CMTime(seconds: start, preferredTimescale: 600),
+                    duration: CMTime(seconds: 0.5, preferredTimescale: 600)
+                )
+            )
+        }
+
+        let ranges = CaptionEmbedder.captionChunkRanges(
+            in: captions,
+            maxCaptionsPerChunk: 4
+        )
+
+        #expect(ranges.map(\.count) == [4, 4, 4])
+        #expect(ranges.allSatisfy { $0.count <= 4 })
+    }
+
     @Test("Caption conversion trims text, skips empty text, and normalizes line breaks")
     func givenMessySegmentsWhenMakingCaptionsThenTextIsNormalized() throws {
         // Given

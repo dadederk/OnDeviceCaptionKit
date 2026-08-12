@@ -7,6 +7,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-12
+
+### Fixed
+- Prevented preferred silent-gap chunk boundaries from moving so early that a later caption movie exceeds the four-caption AVFoundation limit.
+
 ## [0.2.0] - 2026-08-12
 
 ### Added

@@ -668,6 +668,7 @@ nonisolated final class CaptionEmbedder: Sendable {
         maxCaptionsPerChunk: Int
     ) -> [Range<Int>] {
         guard !captionEvents.isEmpty else { return [] }
+        precondition(maxCaptionsPerChunk > 0)
 
         let count = captionEvents.count
         let chunkCount = (count + maxCaptionsPerChunk - 1) / maxCaptionsPerChunk
@@ -699,9 +700,21 @@ nonisolated final class CaptionEmbedder: Sendable {
             if !isLastChunk,
                chunkEnd < captionEvents.endIndex,
                chunkStart < captionEvents.index(before: chunkEnd) {
+                let remainingChunkCount = chunkSizes.count - chunkIndex - 1
+                let remainingCapacity = remainingChunkCount * maxCaptionsPerChunk
+                let minimumChunkSize = max(
+                    1,
+                    captionEvents.distance(from: chunkStart, to: captionEvents.endIndex)
+                        - remainingCapacity
+                )
+                let minimumEnd = captionEvents.index(
+                    chunkStart,
+                    offsetBy: minimumChunkSize
+                )
                 chunkEnd = preferredSplitIndex(
                     in: captionEvents,
                     chunkStart: chunkStart,
+                    minimumEnd: minimumEnd,
                     defaultEnd: chunkEnd
                 )
             }
@@ -710,19 +723,21 @@ nonisolated final class CaptionEmbedder: Sendable {
             chunkStart = chunkEnd
         }
 
+        assert(ranges.allSatisfy { $0.count <= maxCaptionsPerChunk })
         return ranges
     }
 
     private nonisolated static func preferredSplitIndex(
         in captionEvents: [CaptionEvent],
         chunkStart: Int,
+        minimumEnd: Int,
         defaultEnd: Int
     ) -> Int {
-        guard chunkStart < defaultEnd else { return defaultEnd }
+        guard minimumEnd < defaultEnd else { return defaultEnd }
 
         var bestSplit = defaultEnd
         var bestGap = -Double.infinity
-        var index = chunkStart + 1
+        var index = max(chunkStart + 1, minimumEnd)
         while index < defaultEnd {
             let gap = gapBetween(captionEvents[index - 1], captionEvents[index])
             if gap > bestGap {
