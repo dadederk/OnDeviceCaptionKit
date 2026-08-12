@@ -34,7 +34,7 @@ Add OnDeviceCaptionKit to your `Package.swift` dependencies:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/dadederk/OnDeviceCaptionKit.git", from: "0.1.0")
+    .package(url: "https://github.com/dadederk/OnDeviceCaptionKit.git", from: "0.2.0")
 ]
 ```
 
@@ -74,7 +74,7 @@ let segments = result.segments
 Write an SRT file:
 
 ```swift
-try pipeline.writeSRT(segments: segments, besideVideoAt: savedVideoURL)
+try await pipeline.writeSRT(segments: segments, besideVideoAt: savedVideoURL)
 ```
 
 Embed closed captions in a MOV:
@@ -113,6 +113,10 @@ if let requirement = await CaptionPipelineCapabilities.requiresAssetDownload(for
 - `CaptionError`: stable error cases and `code` strings for host-app localization.
 - `CaptionPipelineCapabilities`: provider, locale, and asset-download capability helpers.
 - `SpeechAuthorizationProviding`: injectable speech authorization boundary for apps and tests.
+
+Async transcription, asset preparation, caption embedding, and SRT writing use explicit background execution semantics. The synchronous SRT methods remain available for 0.2.x source compatibility but are deprecated in favor of the async overloads.
+
+Cancelling transcription or caption export propagates `CancellationError`. Caption-embedding timeouts still return the documented SRT fallback result, while AVFoundation cleanup continues independently when an SDK operation is slow to cancel.
 
 ## Privacy and Network
 

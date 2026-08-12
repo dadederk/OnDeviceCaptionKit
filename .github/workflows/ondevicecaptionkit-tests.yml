@@ -9,18 +9,30 @@ on:
 
 jobs:
   macos-spm-tests:
-    name: macos-spm-tests
-    runs-on: macos-latest
+    name: macos-spm-tests (Xcode ${{ matrix.xcode }})
+    runs-on: macos-26
+    strategy:
+      fail-fast: false
+      matrix:
+        xcode: ["26.0.1", "26.6"]
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_${{ matrix.xcode }}.app/Contents/Developer
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+
+      - name: Report toolchain
+        run: swift --version
+
+      - name: Build release configuration with warnings as errors
+        run: swift build -c release -Xswiftc -warnings-as-errors
 
       - name: Run Swift Package tests with coverage
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          swift test --enable-code-coverage 2>&1 | tee artifacts/macos-swift-test.log
+          swift test --enable-code-coverage -Xswiftc -warnings-as-errors 2>&1 | tee artifacts/macos-swift-test.log
           COVERAGE_JSON_PATH="$(swift test --show-code-coverage-path)"
           if [[ -f "$COVERAGE_JSON_PATH" ]]; then
             cp "$COVERAGE_JSON_PATH" artifacts/OnDeviceCaptionKit.json
@@ -31,5 +43,5 @@ jobs:
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v6
         with:
-          name: macos-spm-artifacts
+          name: macos-spm-artifacts-xcode-${{ matrix.xcode }}
           path: artifacts

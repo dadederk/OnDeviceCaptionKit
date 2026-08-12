@@ -55,7 +55,7 @@ struct CaptionTimingTests {
         )
 
         let deferred = try #require(result.deferredSRTSegments)
-        try pipeline.writeSRT(segments: deferred, besideVideoAt: videoURL)
+        try await pipeline.writeSRT(segments: deferred, besideVideoAt: videoURL)
         let srtURL = videoURL.deletingPathExtension().appendingPathExtension("srt")
         let srtContent = try String(contentsOf: srtURL, encoding: .utf8)
 

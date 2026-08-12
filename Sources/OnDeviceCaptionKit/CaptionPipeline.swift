@@ -1,7 +1,7 @@
 import Foundation
 
 @available(macOS 26, *)
-public struct CaptionPipeline {
+public struct CaptionPipeline: Sendable {
     public struct Configuration: Sendable {
         public var transcription: CaptionTranscriptionConfiguration
         public var speechAuthorizationProvider: any SpeechAuthorizationProviding
@@ -24,6 +24,8 @@ public struct CaptionPipeline {
     private let srtWriter: SRTWriter
     private let embedder: any CaptionEmbeddingMuxing
     private let embeddingTimeoutMargin: TimeInterval
+    private let embeddingCleanupScheduler: CaptionEmbeddingTimeout.CleanupScheduler
+    private let discardedCaptionOutputCleanup: @Sendable (URL) -> Void
 
     public init(
         configuration: Configuration = Configuration(),
@@ -43,7 +45,11 @@ public struct CaptionPipeline {
         srtWriter: SRTWriter? = nil,
         embeddingTimeoutMargin: TimeInterval = 2,
         modernProvider: (any CaptionRecognitionProvider)? = nil,
-        legacyProvider: (any CaptionRecognitionProvider)? = nil
+        legacyProvider: (any CaptionRecognitionProvider)? = nil,
+        embeddingCleanupScheduler: CaptionEmbeddingTimeout.CleanupScheduler = CaptionEmbeddingTimeout.sharedCleanupScheduler,
+        discardedCaptionOutputCleanup: @escaping @Sendable (URL) -> Void = { url in
+            try? FileManager.default.removeItem(at: url)
+        }
     ) {
         self.configuration = configuration
         self.modernProvider = modernProvider
@@ -57,6 +63,8 @@ public struct CaptionPipeline {
             self.embedder = CaptionEmbedder(locale: configuration.transcription.locale)
         }
         self.embeddingTimeoutMargin = embeddingTimeoutMargin
+        self.embeddingCleanupScheduler = embeddingCleanupScheduler
+        self.discardedCaptionOutputCleanup = discardedCaptionOutputCleanup
     }
 
     public init(
@@ -98,10 +106,12 @@ public struct CaptionPipeline {
     }
 
     @available(macOS 26, *)
+    @concurrent
     public static func prepareAssets(for locale: Locale, consentGranted: Bool) async throws {
         try await ModernSpeechProvider.prepareAssets(for: locale, consentGranted: consentGranted)
     }
 
+    @concurrent
     public func transcribe(
         from audioURL: URL,
         progressHandler: (@Sendable (Double) -> Void)? = nil
@@ -133,12 +143,15 @@ public struct CaptionPipeline {
         return CaptionTranscriptionResult(segments: segments, providerID: .legacy)
     }
 
+    @concurrent
     public func exportCaptions(
         segments: [CaptionSegment],
         videoURL: URL,
         format: CaptionOutputFormat,
         progressHandler: (@Sendable (Float) -> Void)? = nil
     ) async throws -> CaptionExportResult {
+        try Task.checkCancellation()
+
         switch format {
         case .embeddedMovCaptions:
             do {
@@ -148,10 +161,19 @@ public struct CaptionPipeline {
 
                 let captionedURL = try await CaptionEmbeddingTimeout.run(
                     seconds: timeoutBudget,
-                    onTimeout: {
-                        cancellation.cancel()
-                        CaptionLogger.warning("Caption embedding timed out at export boundary")
-                    },
+                    cleanupScheduler: embeddingCleanupScheduler,
+                    cleanupPlan: CaptionEmbeddingTimeout.CleanupPlan(
+                        prepare: {
+                            cancellation.prepareCancellation()
+                        },
+                        perform: { reason in
+                            cancellation.performPreparedCancellation()
+                            if reason == .timeout {
+                                CaptionLogger.warning("Caption embedding timed out at export boundary")
+                            }
+                        }
+                    ),
+                    discardedSuccessCleanup: discardedCaptionOutputCleanup,
                     operation: {
                         try await self.embedder.embedClosedCaptions(
                             from: segments,
@@ -162,6 +184,8 @@ public struct CaptionPipeline {
                     }
                 )
                 return CaptionExportResult(videoURL: captionedURL, segments: segments)
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 CaptionLogger.error("Caption embedding failed: \(error.localizedDescription)")
                 let warningCode = segments.isEmpty ? "embeddedFailed" : "embeddedFallbackToSRT"
@@ -182,13 +206,26 @@ public struct CaptionPipeline {
         }
     }
 
+    @available(*, deprecated, message: "Use the async writeSRT overload.")
     public func writeSRT(segments: [CaptionSegment], besideVideoAt videoURL: URL) throws {
         let outputURL = srtWriter.srtURLBesideVideo(videoURL)
         try srtWriter.generateSRTFile(from: segments, to: outputURL)
     }
 
+    @available(*, deprecated, message: "Use the async writeSRT overload.")
     public func writeSRT(segments: [CaptionSegment], to outputURL: URL) throws {
         try srtWriter.generateSRTFile(from: segments, to: outputURL)
+    }
+
+    @concurrent
+    public func writeSRT(segments: [CaptionSegment], besideVideoAt videoURL: URL) async throws {
+        let outputURL = srtWriter.srtURLBesideVideo(videoURL)
+        try await srtWriter.generateSRTFile(from: segments, to: outputURL)
+    }
+
+    @concurrent
+    public func writeSRT(segments: [CaptionSegment], to outputURL: URL) async throws {
+        try await srtWriter.generateSRTFile(from: segments, to: outputURL)
     }
 
     private func transcribeWithModernProvider(
@@ -213,5 +250,3 @@ public struct CaptionPipeline {
         #endif
     }
 }
-
-extension CaptionPipeline: @unchecked Sendable {}

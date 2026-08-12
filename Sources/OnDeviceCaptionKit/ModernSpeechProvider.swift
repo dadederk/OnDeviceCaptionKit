@@ -15,11 +15,11 @@ struct ModernSpeechProvider: CaptionRecognitionProvider {
         self.assetsPrepared = assetsPrepared
     }
 
-    static func supportedLocales() async -> [Locale] {
+    @concurrent static func supportedLocales() async -> [Locale] {
         await SpeechTranscriber.supportedLocales
     }
 
-    static func assetDownloadRequirement(for locale: Locale) async -> CaptionAssetDownloadRequirement? {
+    @concurrent static func assetDownloadRequirement(for locale: Locale) async -> CaptionAssetDownloadRequirement? {
         let transcriber = SpeechTranscriber(locale: locale, preset: .timeIndexedProgressiveTranscription)
         let status = await AssetInventory.status(forModules: [transcriber])
         switch status {
@@ -34,7 +34,7 @@ struct ModernSpeechProvider: CaptionRecognitionProvider {
         }
     }
 
-    static func prepareAssets(for locale: Locale, consentGranted: Bool) async throws {
+    @concurrent static func prepareAssets(for locale: Locale, consentGranted: Bool) async throws {
         guard consentGranted else {
             throw CaptionError.assetDownloadRequiresConsent
         }
@@ -49,7 +49,7 @@ struct ModernSpeechProvider: CaptionRecognitionProvider {
         }
     }
 
-    func transcribe(
+    @concurrent func transcribe(
         from audioURL: URL,
         locale: Locale,
         progressHandler: (@Sendable (Double) -> Void)? = nil
@@ -123,6 +123,3 @@ struct ModernSpeechProvider: CaptionRecognitionProvider {
         return segments
     }
 }
-
-@available(macOS 26, *)
-extension ModernSpeechProvider: @unchecked Sendable {}

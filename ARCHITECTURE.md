@@ -16,7 +16,7 @@ CaptionPipeline
    |       |
    |       +--> LegacySpeechProvider (SFSpeechRecognizer)
    |
-   +--> writeSRT(segments:besideVideoAt:)
+   +--> writeSRT(segments:besideVideoAt:) async
    |
    +--> exportCaptions(segments:videoURL:format:)
 ```
@@ -90,3 +90,11 @@ and returns deferredSRTSegments
 ```
 
 The package preserves enough structured output for host apps to offer a sidecar fallback without losing successful transcription work.
+
+## Concurrency Model
+
+The package uses Swift 6.2 Approachable Concurrency without default main-actor isolation. Public transcription, embedding, asset-preparation, and async SRT-writing entry points are marked `@concurrent` so CPU, file, Speech, and AVFoundation work leaves caller isolation explicitly.
+
+Synchronous state shared with Objective-C callbacks is protected by `Synchronization.Mutex`. SDK references without checked sendability are confined to small immutable transfer wrappers whose lifetime and access invariants are documented beside each conformance.
+
+Caption embedding keeps a continuation-based timeout race instead of a task group. This is intentional: the timeout continuation can resume the caller even if an AVFoundation operation ignores task cancellation. `CaptionPipeline` owns the total export timeout when it supplies the shared cancellation holder, while the embedder retains a short timeout for every caption-movie write and the final passthrough export. Cleanup-capable races atomically reserve one of eight outstanding slots before starting, while an owned `OperationQueue` runs at most two potentially blocking SDK cancellation calls concurrently. A reservation remains held until both SDK cleanup and the losing operation finish, bounding queued cleanup and stuck-task retention during a timeout burst; further embedding work fails fast to the existing fallback until capacity returns. Pure timeout races without SDK cleanup do not consume these reservations. Temporary-file deletion is requested as soon as cancellation wins but is deferred by operation and cleanup leases until every task that may still be using or creating those files has finished and AVFoundation cancellation has returned. The losing timeout/progress tasks are cancelled, and the progress task is awaited before a successful export returns.

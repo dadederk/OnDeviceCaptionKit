@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import Testing
 @testable import OnDeviceCaptionKit
 
@@ -38,7 +39,9 @@ struct CaptionTranscriptionProgressTests {
     }
 }
 
-private final class CallCounter: @unchecked Sendable {
-    private(set) var value = 0
-    func increment() { value += 1 }
+private final class CallCounter: Sendable {
+    private let count = Mutex(0)
+
+    var value: Int { count.withLock { $0 } }
+    func increment() { count.withLock { $0 += 1 } }
 }

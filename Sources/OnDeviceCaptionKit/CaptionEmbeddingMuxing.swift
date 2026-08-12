@@ -2,12 +2,12 @@ import AVFoundation
 import Foundation
 
 protocol CaptionEmbeddingMuxing: Sendable {
-    func estimatedEmbeddingTimeout(
+    @concurrent func estimatedEmbeddingTimeout(
         for segments: [CaptionSegment],
         into videoURL: URL
     ) async throws -> TimeInterval
 
-    func embedClosedCaptions(
+    @concurrent func embedClosedCaptions(
         from segments: [CaptionSegment],
         into videoURL: URL,
         cancellation: CaptionEmbeddingCancellationHolder?,

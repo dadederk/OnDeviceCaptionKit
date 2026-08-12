@@ -10,11 +10,19 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "OnDeviceCaptionKit"
+            name: "OnDeviceCaptionKit",
+            swiftSettings: [
+                .enableUpcomingFeature("InferIsolatedConformances"),
+                .enableUpcomingFeature("NonisolatedNonsendingByDefault"),
+            ]
         ),
         .testTarget(
             name: "OnDeviceCaptionKitTests",
-            dependencies: ["OnDeviceCaptionKit"]
+            dependencies: ["OnDeviceCaptionKit"],
+            swiftSettings: [
+                .enableUpcomingFeature("InferIsolatedConformances"),
+                .enableUpcomingFeature("NonisolatedNonsendingByDefault"),
+            ]
         ),
     ],
     swiftLanguageModes: [.v6]

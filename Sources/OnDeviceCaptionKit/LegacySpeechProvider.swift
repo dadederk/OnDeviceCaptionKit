@@ -2,11 +2,12 @@ import AVFoundation
 import Foundation
 import NaturalLanguage
 import Speech
+import Synchronization
 
 public protocol CaptionRecognitionProvider: Sendable {
     var providerID: CaptionRecognitionProviderID { get }
 
-    func transcribe(
+    @concurrent func transcribe(
         from audioURL: URL,
         locale: Locale,
         progressHandler: (@Sendable (Double) -> Void)?
@@ -29,7 +30,7 @@ struct LegacySpeechProvider: CaptionRecognitionProvider {
         self.requestFactory = requestFactory
     }
 
-    func transcribe(
+    @concurrent func transcribe(
         from audioURL: URL,
         locale: Locale,
         progressHandler: (@Sendable (Double) -> Void)? = nil
@@ -76,67 +77,62 @@ struct LegacySpeechProvider: CaptionRecognitionProvider {
         request.taskHint = .dictation
         request.addsPunctuation = true
 
-        final class RecognitionTaskBox: @unchecked Sendable {
-            var task: SFSpeechRecognitionTask?
-        }
-        let taskBox = RecognitionTaskBox()
+        let recognitionBridge = LegacySpeechRecognitionBridge()
         let progressState = ProgressTracker()
 
         let result = try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<LegacyRecognitionSnapshot, Error>) in
-                var hasResumed = false
-                taskBox.task = speechRecognizer.recognitionTask(with: request) { result, error in
-                    guard !hasResumed else { return }
+            try await withCheckedThrowingContinuation { continuation in
+                guard recognitionBridge.install(continuation: continuation) else {
+                    return
+                }
+                guard !Task.isCancelled else {
+                    recognitionBridge.cancel()
+                    return
+                }
+                let task = speechRecognizer.recognitionTask(with: request) { result, error in
+                    guard recognitionBridge.shouldProcessCallback() else { return }
                     if let error {
-                        hasResumed = true
-                        continuation.resume(throwing: error)
+                        recognitionBridge.resume(throwing: error)
                         return
                     }
                     guard let result else {
-                        hasResumed = true
-                        continuation.resume(throwing: CaptionError.recognitionFailed)
+                        recognitionBridge.resume(throwing: CaptionError.recognitionFailed)
                         return
                     }
                     if durationSeconds > 0, let progressHandler {
                         let latestTimestamp = result.bestTranscription.segments.last?.timestamp ?? 0
-                        CaptionTranscriptionProgress.reportStreamProgress(
+                        progressState.report(
                             processedSeconds: latestTimestamp,
                             totalSeconds: durationSeconds,
-                            lastReported: &progressState.lastReported,
                             handler: progressHandler
                         )
                     }
                     if result.isFinal {
-                        hasResumed = true
-                        continuation.resume(returning: LegacyRecognitionSnapshot(result: result))
+                        recognitionBridge.resume(
+                            returning: LegacySpeechRecognitionSnapshot(result: result)
+                        )
                     }
                 }
+                recognitionBridge.install(task: task)
             }
         } onCancel: {
-            taskBox.task?.cancel()
+            recognitionBridge.cancel()
         }
 
+        try Task.checkCancellation()
         CaptionTranscriptionProgress.reportFinalizing(progressHandler)
         let segments = try await processRecognitionResult(result, duration: durationSeconds)
+        try Task.checkCancellation()
         CaptionTranscriptionProgress.reportComplete(progressHandler)
         return segments
     }
 
-    private func processRecognitionResult(_ result: LegacyRecognitionSnapshot, duration: TimeInterval) async throws -> [CaptionSegment] {
-        var allSegments: [LegacyTranscriptionSegmentSnapshot] = []
-
-        for segment in result.segments {
-            let startTime = segment.timestamp
-            let endTime = startTime + segment.duration
-            allSegments.append(
-                LegacyTranscriptionSegmentSnapshot(
-                    substring: segment.substring,
-                    startTime: startTime,
-                    endTime: endTime
-                )
-            )
-        }
-
+    func processRecognitionResult(
+        _ result: LegacySpeechRecognitionSnapshot,
+        duration: TimeInterval
+    ) async throws -> [CaptionSegment] {
+        try Task.checkCancellation()
+        let allSegments = result.segments
         let completeTranscript = allSegments.map(\.substring).joined(separator: " ")
         let sentenceBoundaries = try await identifySentenceBoundaries(in: completeTranscript, segments: allSegments)
 
@@ -146,6 +142,7 @@ struct LegacySpeechProvider: CaptionRecognitionProvider {
         var currentSegmentText = ""
 
         for (index, segment) in allSegments.enumerated() {
+            try Task.checkCancellation()
             let isSentenceBoundary = sentenceBoundaries.contains(index)
             let hasPause = index > 0 ? hasSignificantPause(before: segment, after: allSegments[index - 1]) : false
             currentSegmentText += (currentSegmentText.isEmpty ? "" : " ") + segment.substring
@@ -184,20 +181,29 @@ struct LegacySpeechProvider: CaptionRecognitionProvider {
 
     private func identifySentenceBoundaries(
         in transcript: String,
-        segments: [LegacyTranscriptionSegmentSnapshot]
+        segments: [LegacySpeechRecognitionSnapshot.Segment]
     ) async throws -> [Int] {
         let tagger = NLTagger(tagSchemes: [.tokenType, .lexicalClass, .nameType])
         tagger.string = transcript
 
         var sentenceBoundaries: [Int] = []
         var currentWordCount = 0
+        var wasCancelled = false
 
         tagger.enumerateTags(in: transcript.startIndex..<transcript.endIndex, unit: .sentence, scheme: .tokenType) { _, tokenRange in
+            guard !Task.isCancelled else {
+                wasCancelled = true
+                return false
+            }
             let sentenceText = String(transcript[tokenRange])
             let wordsInSentence = sentenceText.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
 
             var wordCount = 0
             for (index, segment) in segments.enumerated() {
+                guard !Task.isCancelled else {
+                    wasCancelled = true
+                    return false
+                }
                 let segmentWords = segment.substring.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
                 wordCount += segmentWords.count
                 if wordCount >= currentWordCount + wordsInSentence.count {
@@ -210,12 +216,15 @@ struct LegacySpeechProvider: CaptionRecognitionProvider {
             return true
         }
 
+        if wasCancelled {
+            throw CancellationError()
+        }
         return sentenceBoundaries
     }
 
     private func hasSignificantPause(
-        before: LegacyTranscriptionSegmentSnapshot,
-        after: LegacyTranscriptionSegmentSnapshot
+        before: LegacySpeechRecognitionSnapshot.Segment,
+        after: LegacySpeechRecognitionSnapshot.Segment
     ) -> Bool {
         (after.startTime - before.endTime) > 0.5
     }
@@ -238,14 +247,22 @@ struct LegacySpeechProvider: CaptionRecognitionProvider {
     }
 }
 
-extension LegacySpeechProvider: @unchecked Sendable {}
+struct LegacySpeechRecognitionSnapshot: Sendable {
+    struct Segment: Sendable {
+        let substring: String
+        let startTime: TimeInterval
+        let endTime: TimeInterval
+    }
 
-private struct LegacyRecognitionSnapshot: Sendable {
-    let segments: [LegacyTranscriptionSegmentSnapshot]
+    let segments: [Segment]
+
+    init(segments: [Segment]) {
+        self.segments = segments
+    }
 
     init(result: SFSpeechRecognitionResult) {
-        segments = result.bestTranscription.segments.map { segment in
-            LegacyTranscriptionSegmentSnapshot(
+        self.segments = result.bestTranscription.segments.map { segment in
+            Segment(
                 substring: segment.substring,
                 startTime: segment.timestamp,
                 endTime: segment.timestamp + segment.duration
@@ -254,20 +271,110 @@ private struct LegacyRecognitionSnapshot: Sendable {
     }
 }
 
-private struct LegacyTranscriptionSegmentSnapshot: Sendable {
-    let substring: String
-    let startTime: TimeInterval
-    let endTime: TimeInterval
-
-    var timestamp: TimeInterval {
-        startTime
+/// SFSpeechRecognitionTask is not Sendable. The bridge protects every access
+/// to it and the continuation with one lock, and resumes at most once.
+final class LegacySpeechRecognitionBridge: Sendable {
+    /// `SFSpeechRecognitionTask` has no Sendable conformance. The wrapper is
+    /// immutable and the bridge's mutex is the sole owner after installation.
+    /// Remove this escape hatch when Speech exposes a Sendable task handle.
+    private struct SpeechTask: @unchecked Sendable {
+        let value: SFSpeechRecognitionTask
     }
 
-    var duration: TimeInterval {
-        endTime - startTime
+    private struct State: ~Copyable {
+        var continuation: CheckedContinuation<LegacySpeechRecognitionSnapshot, Error>?
+        var task: SpeechTask?
+        var isFinished = false
+    }
+
+    private let state = Mutex(State())
+
+    func install(
+        continuation: CheckedContinuation<LegacySpeechRecognitionSnapshot, Error>
+    ) -> Bool {
+        let shouldCancel = state.withLock { state in
+            guard !state.isFinished else { return true }
+            state.continuation = continuation
+            return false
+        }
+        if shouldCancel {
+            continuation.resume(throwing: CancellationError())
+            return false
+        }
+        return true
+    }
+
+    func install(task: SFSpeechRecognitionTask) {
+        let task = SpeechTask(value: task)
+        let shouldCancel = state.withLock { state in
+            guard !state.isFinished else { return true }
+            state.task = task
+            return false
+        }
+        if shouldCancel {
+            task.value.cancel()
+        }
+    }
+
+    func shouldProcessCallback() -> Bool {
+        state.withLock { !$0.isFinished }
+    }
+
+    func resume(returning snapshot: LegacySpeechRecognitionSnapshot) {
+        finish(with: .success(snapshot), cancelTask: false)
+    }
+
+    func resume(throwing error: Error) {
+        finish(with: .failure(error), cancelTask: true)
+    }
+
+    func cancel() {
+        finish(with: .failure(CancellationError()), cancelTask: true)
+    }
+
+    private func finish(
+        with result: sending Result<LegacySpeechRecognitionSnapshot, Error>,
+        cancelTask: Bool
+    ) {
+        let completion = state.withLock { state -> (
+            CheckedContinuation<LegacySpeechRecognitionSnapshot, Error>?,
+            SpeechTask?
+        ) in
+            guard !state.isFinished else { return (nil, nil) }
+            state.isFinished = true
+            let continuation = state.continuation
+            let task = state.task
+            state.continuation = nil
+            state.task = nil
+            return (continuation, task)
+        }
+        if cancelTask {
+            completion.1?.value.cancel()
+        }
+        completion.0?.resume(with: result)
     }
 }
 
-private final class ProgressTracker: @unchecked Sendable {
-    var lastReported = 0.0
+private final class ProgressTracker: Sendable {
+    private let lastReported = Mutex(0.0)
+
+    func report(
+        processedSeconds: TimeInterval,
+        totalSeconds: TimeInterval,
+        handler: @Sendable (Double) -> Void
+    ) {
+        let progress = CaptionTranscriptionProgress.streamProgress(
+            processedSeconds: processedSeconds,
+            totalSeconds: totalSeconds
+        )
+        let progressToReport = lastReported.withLock { lastReported in
+            CaptionTranscriptionProgress.progressToReport(
+                progress,
+                lastReported: &lastReported
+            )
+        }
+        if let progressToReport {
+            handler(progressToReport)
+        }
+    }
 }

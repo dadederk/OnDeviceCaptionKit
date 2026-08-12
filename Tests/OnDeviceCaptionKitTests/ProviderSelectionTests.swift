@@ -1,5 +1,6 @@
 import Foundation
 import Speech
+import Synchronization
 import Testing
 @testable import OnDeviceCaptionKit
 
@@ -102,20 +103,22 @@ private struct ThrowingCaptionProvider: CaptionRecognitionProvider {
     }
 }
 
-private final class TrackingCaptionProvider: CaptionRecognitionProvider, @unchecked Sendable {
+private final class TrackingCaptionProvider: CaptionRecognitionProvider, Sendable {
     let providerID: CaptionRecognitionProviderID
-    private(set) var callCount = 0
+    private let calls = Mutex(0)
+
+    var callCount: Int { calls.withLock { $0 } }
 
     init(providerID: CaptionRecognitionProviderID) {
         self.providerID = providerID
     }
 
-    func transcribe(
+    @concurrent func transcribe(
         from audioURL: URL,
         locale: Locale,
         progressHandler: (@Sendable (Double) -> Void)?
     ) async throws -> [CaptionSegment] {
-        callCount += 1
+        calls.withLock { $0 += 1 }
         return [CaptionSegment(index: 1, startTime: 0, endTime: 1, text: "hello")]
     }
 }

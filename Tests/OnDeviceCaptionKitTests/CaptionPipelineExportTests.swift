@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import Testing
 @testable import OnDeviceCaptionKit
 
@@ -7,7 +8,7 @@ struct CaptionPipelineExportTests {
     func givenEmbeddedModeWhenExportingThenCaptionMuxerResultIsUsed() async throws {
         let sourceURL = URL(fileURLWithPath: "/tmp/source.mov")
         let captionedURL = URL(fileURLWithPath: "/tmp/captioned.mov")
-        let pipeline = CaptionPipeline(
+        let pipeline = makePipeline(
             embedder: StubCaptionMuxer(result: .success(captionedURL))
         )
 
@@ -25,7 +26,7 @@ struct CaptionPipelineExportTests {
     @Test("SRT sidecar mode returns deferred segments without writing immediately")
     func givenSRTModeWhenExportingThenSegmentsAreDeferred() async throws {
         let sourceURL = URL(fileURLWithPath: "/tmp/source.mov")
-        let pipeline = CaptionPipeline(
+        let pipeline = makePipeline(
             embedder: StubCaptionMuxer(result: .failure(.unexpectedCaptionMux))
         )
 
@@ -40,10 +41,41 @@ struct CaptionPipelineExportTests {
         #expect(result.warningCode == nil)
     }
 
+    @Test(
+        "Pre-cancelled caption exports propagate cancellation for every format",
+        arguments: [CaptionOutputFormat.embeddedMovCaptions, .srtSidecar]
+    )
+    func givenPreCancelledExportWhenExportingThenCancellationPropagates(
+        format: CaptionOutputFormat
+    ) async {
+        let sourceURL = URL(fileURLWithPath: "/tmp/source.mov")
+        let pipeline = makePipeline(
+            embedder: StubCaptionMuxer(result: .failure(.unexpectedCaptionMux))
+        )
+
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await pipeline.exportCaptions(
+                segments: sampleSegments,
+                videoURL: sourceURL,
+                format: format
+            )
+        }
+
+        do {
+            _ = try await task.value
+            Issue.record("Expected cancellation")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+    }
+
     @Test("Embedded subtitle mode falls back to deferred SRT when caption muxing fails")
     func givenEmbeddedModeWhenCaptionMuxingFailsThenSRTFallbackIsReturned() async throws {
         let sourceURL = URL(fileURLWithPath: "/tmp/source.mov")
-        let pipeline = CaptionPipeline(
+        let pipeline = makePipeline(
             embedder: StubCaptionMuxer(result: .failure(.captionMuxFailed))
         )
 
@@ -61,7 +93,7 @@ struct CaptionPipelineExportTests {
     @Test("Embedded subtitle mode preserves MOV when caption muxing fails without segments")
     func givenEmbeddedModeWhenAllSubtitleWritesFailThenVideoResultIsPreserved() async throws {
         let sourceURL = URL(fileURLWithPath: "/tmp/source.mov")
-        let pipeline = CaptionPipeline(
+        let pipeline = makePipeline(
             embedder: StubCaptionMuxer(result: .failure(.captionMuxFailed))
         )
 
@@ -82,7 +114,7 @@ struct CaptionPipelineExportTests {
     )
     func givenEmbeddedModeWhenCaptionMuxingStallsThenSRTFallbackIsReturned() async throws {
         let sourceURL = URL(fileURLWithPath: "/tmp/source.mov")
-        let pipeline = CaptionPipeline(
+        let pipeline = makePipeline(
             embedder: StubCaptionMuxer(behavior: .stall),
             embeddingTimeoutMargin: 0
         )
@@ -105,7 +137,7 @@ struct CaptionPipelineExportTests {
     func givenMultiChunkWorkWhenBudgetScalesThenEmbeddingSucceeds() async throws {
         let sourceURL = URL(fileURLWithPath: "/tmp/source.mov")
         let captionedURL = URL(fileURLWithPath: "/tmp/captioned.mov")
-        let pipeline = CaptionPipeline(
+        let pipeline = makePipeline(
             embedder: StubCaptionMuxer(behavior: .slowSuccess(captionedURL, chunkCount: 3, stepDelay: 0.05)),
             embeddingTimeoutMargin: 0.5
         )
@@ -121,13 +153,46 @@ struct CaptionPipelineExportTests {
     }
 
     @Test(
+        "A late successful export that loses the timeout race is deleted",
+        .timeLimit(.minutes(1))
+    )
+    func givenLateSuccessfulExportWhenTimeoutWinsThenTemporaryMovieIsRemoved() async throws {
+        let sourceURL = URL(fileURLWithPath: "/tmp/source.mov")
+        let lateURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CaptionPipelineExportTests-late-\(UUID().uuidString)")
+            .appendingPathExtension("mov")
+        let cleanupEvents = AsyncStream<Void>.makeStream()
+        var cleanupIterator = cleanupEvents.stream.makeAsyncIterator()
+        let muxer = StubCaptionMuxer(behavior: .successAfterCancellation(lateURL))
+        let pipeline = makePipeline(
+            embedder: muxer,
+            embeddingTimeoutMargin: 0,
+            discardedCaptionOutputCleanup: { url in
+                try? FileManager.default.removeItem(at: url)
+                _ = cleanupEvents.continuation.yield()
+                cleanupEvents.continuation.finish()
+            }
+        )
+
+        let result = try await pipeline.exportCaptions(
+            segments: sampleSegments,
+            videoURL: sourceURL,
+            format: .embeddedMovCaptions
+        )
+
+        #expect(result.warningCode == "embeddedFallbackToSRT")
+        _ = await cleanupIterator.next()
+        #expect(!FileManager.default.fileExists(atPath: lateURL.path))
+    }
+
+    @Test(
         "Export-service timeout cancels in-flight caption embedding",
         .timeLimit(.minutes(1))
     )
     func givenStalledEmbeddingWhenTimeoutFiresThenCancellationIsInvoked() async throws {
         let sourceURL = URL(fileURLWithPath: "/tmp/source.mov")
         let muxer = StubCaptionMuxer(behavior: .stallUntilCancelled)
-        let pipeline = CaptionPipeline(
+        let pipeline = makePipeline(
             embedder: muxer,
             embeddingTimeoutMargin: 0
         )
@@ -139,17 +204,71 @@ struct CaptionPipelineExportTests {
         )
 
         #expect(result.warningCode == "embeddedFallbackToSRT")
+        for _ in 0..<100 where muxer.receivedCancellation?.didCancel != true {
+            try? await Task.sleep(for: .milliseconds(1))
+        }
         #expect(muxer.receivedCancellation?.didCancel == true)
+    }
+
+    @Test("Parent cancellation propagates instead of returning an SRT fallback")
+    func givenCancelledParentWhenExportingThenCancellationPropagates() async {
+        let sourceURL = URL(fileURLWithPath: "/tmp/source.mov")
+        let muxer = StubCaptionMuxer(behavior: .stallForParentCancellation)
+        let pipeline = makePipeline(embedder: muxer)
+
+        let task = Task {
+            try await pipeline.exportCaptions(
+                segments: sampleSegments,
+                videoURL: sourceURL,
+                format: .embeddedMovCaptions
+            )
+        }
+
+        for _ in 0..<100 where muxer.receivedCancellation == nil {
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            Issue.record("Expected cancellation")
+        } catch is CancellationError {
+            for _ in 0..<100 where muxer.receivedCancellation?.didCancel != true {
+                try? await Task.sleep(for: .milliseconds(1))
+            }
+            #expect(muxer.receivedCancellation?.didCancel == true)
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
     }
 
     private var sampleSegments: [CaptionSegment] {
         [CaptionSegment(index: 1, startTime: 0, endTime: 1, text: "Hello")]
     }
+
+    private func makePipeline(
+        embedder: any CaptionEmbeddingMuxing,
+        embeddingTimeoutMargin: TimeInterval = 2,
+        discardedCaptionOutputCleanup: @escaping @Sendable (URL) -> Void = { url in
+            try? FileManager.default.removeItem(at: url)
+        }
+    ) -> CaptionPipeline {
+        CaptionPipeline(
+            embedder: embedder,
+            embeddingTimeoutMargin: embeddingTimeoutMargin,
+            embeddingCleanupScheduler: CaptionEmbeddingTimeout.CleanupScheduler(),
+            discardedCaptionOutputCleanup: discardedCaptionOutputCleanup
+        )
+    }
 }
 
-private final class StubCaptionMuxer: CaptionEmbeddingMuxing, @unchecked Sendable {
+private final class StubCaptionMuxer: CaptionEmbeddingMuxing, Sendable {
     let behavior: Behavior
-    private(set) var receivedCancellation: CaptionEmbeddingCancellationHolder?
+    private let cancellation = Mutex<CaptionEmbeddingCancellationHolder?>(nil)
+
+    var receivedCancellation: CaptionEmbeddingCancellationHolder? {
+        cancellation.withLock { $0 }
+    }
 
     init(result: Result<URL, CaptionPipelineExportTestError>) {
         switch result {
@@ -164,7 +283,7 @@ private final class StubCaptionMuxer: CaptionEmbeddingMuxing, @unchecked Sendabl
         self.behavior = behavior
     }
 
-    func estimatedEmbeddingTimeout(
+    @concurrent func estimatedEmbeddingTimeout(
         for segments: [CaptionSegment],
         into videoURL: URL
     ) async throws -> TimeInterval {
@@ -175,20 +294,22 @@ private final class StubCaptionMuxer: CaptionEmbeddingMuxing, @unchecked Sendabl
                 perStepTimeout: stepDelay,
                 margin: 0
             )
-        case .stall, .stallUntilCancelled:
+        case .stall, .stallUntilCancelled, .successAfterCancellation:
             return 0.01
+        case .stallForParentCancellation:
+            return 60
         default:
             return CaptionEmbeddingTimeoutBudget.totalTimeout(chunkCount: 0, perStepTimeout: 10)
         }
     }
 
-    func embedClosedCaptions(
+    @concurrent func embedClosedCaptions(
         from segments: [CaptionSegment],
         into videoURL: URL,
         cancellation: CaptionEmbeddingCancellationHolder?,
         progressHandler: (@Sendable (Float) -> Void)? = nil
     ) async throws -> URL {
-        receivedCancellation = cancellation
+        self.cancellation.withLock { $0 = cancellation }
 
         switch behavior {
         case .success(let url):
@@ -208,6 +329,13 @@ private final class StubCaptionMuxer: CaptionEmbeddingMuxing, @unchecked Sendabl
                 try await Task.sleep(for: .milliseconds(20))
             }
             throw CaptionPipelineExportTestError.captionMuxFailed
+        case .stallForParentCancellation:
+            try await Task.sleep(for: .seconds(60))
+            throw CaptionPipelineExportTestError.captionMuxFailed
+        case .successAfterCancellation(let url):
+            try? await Task.sleep(for: .seconds(60))
+            try Data().write(to: url)
+            return url
         }
     }
 
@@ -217,6 +345,8 @@ private final class StubCaptionMuxer: CaptionEmbeddingMuxing, @unchecked Sendabl
         case stall
         case slowSuccess(URL, chunkCount: Int, stepDelay: TimeInterval)
         case stallUntilCancelled
+        case stallForParentCancellation
+        case successAfterCancellation(URL)
     }
 }
 

@@ -31,6 +31,94 @@ struct CaptionEmbedderTests {
         #expect(budget == 42)
     }
 
+    @Test("Each caption embedding step keeps its short timeout", .timeLimit(.minutes(1)))
+    func givenStalledEmbeddingStepWhenTimeoutExpiresThenStepCancelsIndependently() async {
+        let cleanupScheduler = CaptionEmbeddingTimeout.CleanupScheduler()
+        let cancellationHolder = CaptionEmbeddingCancellationHolder()
+        let temporaryFiles = CaptionEmbeddingTemporaryFiles()
+        let embedder = CaptionEmbedder(
+            embeddingStepTimeout: 0.01,
+            embeddingCleanupScheduler: cleanupScheduler
+        )
+
+        do {
+            _ = try await embedder.runEmbeddingStep(
+                named: "Test caption chunk",
+                cancellationHolder: cancellationHolder,
+                temporaryFiles: temporaryFiles
+            ) {
+                try await Task.sleep(for: .seconds(60))
+                return "unreachable"
+            }
+            Issue.record("Expected the individual embedding step to time out")
+        } catch let error as CaptionEmbeddingError {
+            guard case .timedOut = error else {
+                Issue.record("Unexpected embedding error: \(error)")
+                return
+            }
+            #expect(cancellationHolder.didCancel)
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+    }
+
+    @Test(
+        "Timed-out steps retain temporary files until late operation completion",
+        .timeLimit(.minutes(1))
+    )
+    func givenLateEmbeddingCompletionWhenCleanupIsRequestedThenFileIsRemovedAfterUse() async throws {
+        let cleanupScheduler = CaptionEmbeddingTimeout.CleanupScheduler()
+        let cancellationHolder = CaptionEmbeddingCancellationHolder()
+        let temporaryFiles = CaptionEmbeddingTemporaryFiles()
+        let operationGate = CaptionEmbeddingTestGate()
+        let operationStarted = AsyncStream<Void>.makeStream()
+        var startedIterator = operationStarted.stream.makeAsyncIterator()
+        let temporaryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CaptionEmbedderTests-late-\(UUID().uuidString)")
+            .appendingPathExtension("mov")
+        try Data("initial".utf8).write(to: temporaryURL)
+        temporaryFiles.register(temporaryURL)
+        #expect(cancellationHolder.setTemporaryFiles(temporaryFiles))
+        defer { try? FileManager.default.removeItem(at: temporaryURL) }
+
+        let embedder = CaptionEmbedder(
+            embeddingStepTimeout: 0.01,
+            embeddingCleanupScheduler: cleanupScheduler
+        )
+        let step = Task {
+            try await embedder.runEmbeddingStep(
+                named: "Late caption export",
+                cancellationHolder: cancellationHolder,
+                temporaryFiles: temporaryFiles
+            ) {
+                _ = operationStarted.continuation.yield()
+                operationStarted.continuation.finish()
+                await operationGate.wait()
+                try Data("late".utf8).write(to: temporaryURL)
+            }
+        }
+
+        _ = await startedIterator.next()
+        do {
+            try await step.value
+            Issue.record("Expected the embedding step to time out")
+        } catch let error as CaptionEmbeddingError {
+            guard case .timedOut = error else {
+                Issue.record("Unexpected embedding error: \(error)")
+                return
+            }
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+
+        #expect(FileManager.default.fileExists(atPath: temporaryURL.path))
+        await operationGate.open()
+        for _ in 0..<1_000 where FileManager.default.fileExists(atPath: temporaryURL.path) {
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(!FileManager.default.fileExists(atPath: temporaryURL.path))
+    }
+
     @Test("Caption chunking keeps extra captions in trailing movies")
     func givenSevenCaptionsWhenChunkingThenSplitsThreeThenFour() {
         let ranges = CaptionEmbedder.captionChunkRanges(
@@ -202,6 +290,9 @@ struct CaptionEmbedderTests {
         let extendedLanguageTag = try await captionTrack.load(.extendedLanguageTag)
         #expect(languageCode == "eng")
         #expect(extendedLanguageTag == "en-US")
+
+        let decodedCaptions = try await readCaptions(from: captionedURL, expectedCount: 1)
+        #expect(collapsedConsecutiveTexts(in: decodedCaptions) == ["Hello"])
     }
 
     @Test(
@@ -359,31 +450,127 @@ struct CaptionEmbedderTests {
         shortAudioChunkCount: Int,
         fullAudioChunkCount: Int
     ) async throws -> URL {
-        let videoDurationSeconds = max(1, Int(ceil(Double(videoFrameCount) * videoFrameSpacingSeconds)))
-        let videoURL = try await makeTinyMOV(
-            includeAudio: false,
-            durationSeconds: videoDurationSeconds
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CaptionEmbedderTests-twoAudio-\(UUID().uuidString)")
+            .appendingPathExtension("mov")
+        try? FileManager.default.removeItem(at: outputURL)
+
+        let frameRate: Int32 = 30
+        let sampleRate = 44_100.0
+        let framesPerChunk = Int(sampleRate) / Int(frameRate)
+
+        let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
+        let videoInput = AVAssetWriterInput(
+            mediaType: .video,
+            outputSettings: [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: 16,
+                AVVideoHeightKey: 16
+            ]
         )
-        defer { try? FileManager.default.removeItem(at: videoURL) }
+        videoInput.expectsMediaDataInRealTime = false
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: videoInput,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: 16,
+                kCVPixelBufferHeightKey as String: 16
+            ]
+        )
+        guard writer.canAdd(videoInput) else { throw CaptionEmbeddingTestError.cannotAddVideoInput }
+        writer.add(videoInput)
 
-        let shortAudioURL = try await makeAudioOnlyM4A(chunkCount: shortAudioChunkCount)
-        defer { try? FileManager.default.removeItem(at: shortAudioURL) }
-        let partialMuxedURL = try await muxExportSessionVideo(videoURL: videoURL, micAudioURL: shortAudioURL)
-        defer { try? FileManager.default.removeItem(at: partialMuxedURL) }
+        func makeAudioInput() throws -> AVAssetWriterInput {
+            let input = AVAssetWriterInput(
+                mediaType: .audio,
+                outputSettings: [
+                    AVFormatIDKey: kAudioFormatMPEG4AAC,
+                    AVNumberOfChannelsKey: 1,
+                    AVSampleRateKey: sampleRate,
+                    AVEncoderBitRateKey: 64_000
+                ]
+            )
+            input.expectsMediaDataInRealTime = false
+            guard writer.canAdd(input) else { throw CaptionEmbeddingTestError.cannotAddAudioInput }
+            writer.add(input)
+            return input
+        }
 
-        let fullAudioURL = try await makeAudioOnlyM4A(chunkCount: fullAudioChunkCount)
-        defer { try? FileManager.default.removeItem(at: fullAudioURL) }
-        return try await muxExportSessionVideo(videoURL: partialMuxedURL, micAudioURL: fullAudioURL)
+        let shortAudioInput = try makeAudioInput()
+        let fullAudioInput = try makeAudioInput()
+
+        guard writer.startWriting() else {
+            throw writer.error ?? CaptionEmbeddingTestError.cannotStartWriter
+        }
+        writer.startSession(atSourceTime: .zero)
+
+        let pixelBuffer = try makePixelBuffer(width: 16, height: 16)
+
+        func appendAudio(_ input: AVAssetWriterInput, chunk: Int) async throws {
+            let time = CMTime(
+                value: CMTimeValue(chunk * framesPerChunk),
+                timescale: CMTimeScale(sampleRate)
+            )
+            let buffer = try makeSilentAudioSampleBuffer(
+                presentationTime: time,
+                sampleRate: sampleRate,
+                frameCount: framesPerChunk
+            )
+            try await waitUntilReady(input)
+            guard input.isReadyForMoreMediaData, input.append(buffer) else {
+                writer.cancelWriting()
+                throw writer.error ?? CaptionEmbeddingTestError.cannotAppendFrame
+            }
+        }
+
+        // Audio is dense (30 chunks/second); video is sparse (one frame every
+        // `videoFrameSpacingSeconds`). Interleave both by presentation time so the
+        // writer keeps every input ready, mirroring a near-static screen recording.
+        let chunkDuration = Double(framesPerChunk) / sampleRate
+        let totalChunks = max(shortAudioChunkCount, fullAudioChunkCount)
+        var nextVideoFrame = 0
+        for index in 0..<totalChunks {
+            let chunkTime = Double(index) * chunkDuration
+            while nextVideoFrame < videoFrameCount,
+                  Double(nextVideoFrame) * videoFrameSpacingSeconds <= chunkTime {
+                let videoTime = CMTime(seconds: Double(nextVideoFrame) * videoFrameSpacingSeconds, preferredTimescale: 600)
+                try await waitUntilReady(videoInput)
+                guard videoInput.isReadyForMoreMediaData,
+                      adaptor.append(pixelBuffer, withPresentationTime: videoTime) else {
+                    writer.cancelWriting()
+                    throw writer.error ?? CaptionEmbeddingTestError.cannotAppendFrame
+                }
+                nextVideoFrame += 1
+                if nextVideoFrame == videoFrameCount { videoInput.markAsFinished() }
+            }
+
+            if index < shortAudioChunkCount {
+                try await appendAudio(shortAudioInput, chunk: index)
+                if index == shortAudioChunkCount - 1 { shortAudioInput.markAsFinished() }
+            }
+
+            if index < fullAudioChunkCount {
+                try await appendAudio(fullAudioInput, chunk: index)
+                if index == fullAudioChunkCount - 1 { fullAudioInput.markAsFinished() }
+            }
+        }
+        if nextVideoFrame < videoFrameCount { videoInput.markAsFinished() }
+
+        await finishWriting(writer)
+        guard writer.status == .completed else {
+            throw writer.error ?? CaptionEmbeddingTestError.writerFailed
+        }
+        return outputURL
     }
 
-    private func makeAudioOnlyM4A(chunkCount: Int = 30) async throws -> URL {
+    private func makeAudioOnlyM4A() async throws -> URL {
         let outputURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("CaptionEmbedderTests-mic-\(UUID().uuidString)")
             .appendingPathExtension("m4a")
         try? FileManager.default.removeItem(at: outputURL)
 
         let sampleRate = 44_100.0
-        let chunks = max(1, chunkCount)
+        let chunks = 30
         let framesPerChunk = Int(sampleRate) / 30
 
         let writer = try AVAssetWriter(outputURL: outputURL, fileType: .m4a)
@@ -703,4 +890,25 @@ private enum CaptionEmbeddingTestError: Error {
     case cannotStartReader
     case readerFailed
     case writerFailed
+}
+
+private actor CaptionEmbeddingTestGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func open() {
+        isOpen = true
+        let waiters = self.waiters
+        self.waiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
 }

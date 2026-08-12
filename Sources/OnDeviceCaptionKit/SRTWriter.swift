@@ -1,9 +1,18 @@
 import Foundation
 
-nonisolated final class SRTWriter: @unchecked Sendable {
+nonisolated final class SRTWriter: Sendable {
     init() {}
 
     func generateSRTFile(from segments: [CaptionSegment], to outputURL: URL) throws {
+        try writeSRTFile(from: segments, to: outputURL)
+    }
+
+    @concurrent
+    func generateSRTFile(from segments: [CaptionSegment], to outputURL: URL) async throws {
+        try writeSRTFile(from: segments, to: outputURL)
+    }
+
+    private func writeSRTFile(from segments: [CaptionSegment], to outputURL: URL) throws {
         CaptionLogger.info("Generating SRT file with \(segments.count) segment(s)")
         let srtContent = createSRTContent(from: segments)
         try srtContent.write(to: outputURL, atomically: true, encoding: .utf8)

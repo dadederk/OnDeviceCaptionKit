@@ -20,9 +20,14 @@ enum CaptionTranscriptionProgress {
     ) {
         guard let handler else { return }
         let progress = streamProgress(processedSeconds: processedSeconds, totalSeconds: totalSeconds)
-        guard progress > lastReported + 0.005 || progress >= streamHeadroom else { return }
-        lastReported = progress
+        guard let progress = progressToReport(progress, lastReported: &lastReported) else { return }
         handler(progress)
+    }
+
+    static func progressToReport(_ progress: Double, lastReported: inout Double) -> Double? {
+        guard progress > lastReported + 0.005 || progress >= streamHeadroom else { return nil }
+        lastReported = progress
+        return progress
     }
 
     static func reportFinalizing(_ handler: (@Sendable (Double) -> Void)?) {

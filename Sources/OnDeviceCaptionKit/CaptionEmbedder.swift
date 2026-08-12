@@ -2,10 +2,12 @@ import Foundation
 import AVFoundation
 
 @available(macOS 26, *)
-nonisolated final class CaptionEmbedder: @unchecked Sendable {
-    private struct UncheckedSendableBox<Value>: @unchecked Sendable {
-        let value: Value
-        init(_ value: Value) { self.value = value }
+nonisolated final class CaptionEmbedder: Sendable {
+    /// Checked-Sendable representation used at every task boundary. AVCaption
+    /// instances are constructed only inside the task that passes them to AVFoundation.
+    private struct CaptionEvent: Sendable {
+        let text: String
+        let timeRange: CMTimeRange
     }
 
     private struct CaptionMoviePart: Sendable {
@@ -17,53 +19,55 @@ nonisolated final class CaptionEmbedder: @unchecked Sendable {
     }
 
     private static let defaultFrameDuration = CMTime(value: 1001, timescale: 30_000)
-    private static let defaultEmbeddingTimeout: TimeInterval = 10
+    private static let defaultEmbeddingStepTimeout: TimeInterval = 10
     private static let maxCaptionDurationSeconds: TimeInterval = 3
     private static let maxCaptionsPerCaptionMovie = 4
     private static let minGapForCaptionChunkSplitSeconds: TimeInterval = 0.25
     private static let undefinedLanguageCode = "und"
-    private let fileManager: FileManager
-    private let embeddingTimeout: TimeInterval
+    private let embeddingStepTimeout: TimeInterval
+    private let embeddingCleanupScheduler: CaptionEmbeddingTimeout.CleanupScheduler
     private let captionLanguageCode: String
     private let captionExtendedLanguageTag: String
 
     nonisolated init(
-        fileManager: FileManager = .default,
-        embeddingTimeout: TimeInterval = CaptionEmbedder.defaultEmbeddingTimeout,
-        locale: Locale = Locale(identifier: "en-US")
+        embeddingStepTimeout: TimeInterval = CaptionEmbedder.defaultEmbeddingStepTimeout,
+        locale: Locale = Locale(identifier: "en-US"),
+        embeddingCleanupScheduler: CaptionEmbeddingTimeout.CleanupScheduler = CaptionEmbeddingTimeout.sharedCleanupScheduler
     ) {
-        self.fileManager = fileManager
-        self.embeddingTimeout = embeddingTimeout
+        self.embeddingStepTimeout = embeddingStepTimeout
+        self.embeddingCleanupScheduler = embeddingCleanupScheduler
         let tags = Self.captionLanguageTags(for: locale)
         self.captionLanguageCode = tags.languageCode
         self.captionExtendedLanguageTag = tags.extendedLanguageTag
     }
 
-    nonisolated func estimatedEmbeddingTimeout(
+    @concurrent func estimatedEmbeddingTimeout(
         for segments: [CaptionSegment],
-        into videoURL: URL
+        into _: URL
     ) async throws -> TimeInterval {
-        let captions = try makeClosedCaptions(
+        // An uncapped canonical count is a conservative upper bound that avoids
+        // loading the asset or running AVFoundation caption conformance twice.
+        let captionEvents = makeCanonicalCaptionEvents(
             from: segments,
-            maxTimelineEnd: try await sourceVideoDuration(for: videoURL)
+            frameDuration: Self.defaultFrameDuration
         )
-        guard !captions.isEmpty else {
+        guard !captionEvents.isEmpty else {
             return CaptionEmbeddingTimeoutBudget.totalTimeout(
                 chunkCount: 0,
-                perStepTimeout: embeddingTimeout
+                perStepTimeout: embeddingStepTimeout
             )
         }
         let chunkRanges = Self.captionChunkRanges(
-            in: captions,
+            in: captionEvents,
             maxCaptionsPerChunk: Self.maxCaptionsPerCaptionMovie
         )
         return CaptionEmbeddingTimeoutBudget.totalTimeout(
             chunkCount: chunkRanges.count,
-            perStepTimeout: embeddingTimeout
+            perStepTimeout: embeddingStepTimeout
         )
     }
 
-    nonisolated func embedClosedCaptions(
+    @concurrent func embedClosedCaptions(
         from segments: [CaptionSegment],
         into videoURL: URL,
         cancellation: CaptionEmbeddingCancellationHolder? = nil,
@@ -73,122 +77,186 @@ nonisolated final class CaptionEmbedder: @unchecked Sendable {
         logGeneratedSegments(segments)
         logFileSize(at: videoURL, label: "Source")
 
-        let captions = try makeClosedCaptions(from: segments, maxTimelineEnd: try await sourceVideoDuration(for: videoURL))
-        guard !captions.isEmpty else { throw CaptionEmbeddingError.noTracksToCopy }
-        log("Conformed \(captions.count) caption(s)")
-        logConformedCaptions(captions)
+        let captionEvents = makeCanonicalCaptionEvents(
+            from: segments,
+            maxTimelineEnd: try await sourceVideoDuration(for: videoURL)
+        )
+        guard !captionEvents.isEmpty else { throw CaptionEmbeddingError.noTracksToCopy }
 
         let outputURL = temporaryOutputURL()
-        try? fileManager.removeItem(at: outputURL)
+        try? FileManager.default.removeItem(at: outputURL)
+        let temporaryFiles = CaptionEmbeddingTemporaryFiles()
+        temporaryFiles.register(outputURL)
+        let rootOperationLease = temporaryFiles.beginOperation()
+        let finishRootOperation: @Sendable () -> Void = {
+            temporaryFiles.requestCleanup()
+            rootOperationLease.finish()
+        }
 
+        let ownsTimeout = cancellation == nil
         let cancellationHolder = cancellation ?? CaptionEmbeddingCancellationHolder()
-        let work = UncheckedSendableBox((
-            captions: captions,
-            videoURL: videoURL,
-            outputURL: outputURL,
-            cancellationHolder: cancellationHolder
-        ))
+        guard cancellationHolder.setTemporaryFiles(temporaryFiles) else {
+            finishRootOperation()
+            throw CancellationError()
+        }
+        defer { cancellationHolder.clearTemporaryFiles(temporaryFiles) }
+        let chunkCount = Self.captionChunkRanges(
+            in: captionEvents,
+            maxCaptionsPerChunk: Self.maxCaptionsPerCaptionMovie
+        ).count
+        let totalTimeout = CaptionEmbeddingTimeoutBudget.totalTimeout(
+            chunkCount: chunkCount,
+            perStepTimeout: embeddingStepTimeout
+        )
 
-        do {
+        let operation: @Sendable () async throws -> URL = { [self] in
+            log("Prepared \(captionEvents.count) caption event(s)")
+
             let captionMovieParts = try await writeCaptionTrackMovies(
-                captions: work.value.captions,
-                cancellationHolder: work.value.cancellationHolder
-            )
-            defer { removeCaptionMovieParts(captionMovieParts) }
-
-            try await CaptionEmbeddingTimeout.run(
-                seconds: embeddingTimeout,
-                onTimeout: { [self] in
-                    log("Captioned movie export timed out after \(Int(embeddingTimeout))s; cancelling export")
-                    work.value.cancellationHolder.cancel()
-                },
-                operation: { [self] in
-                    try await composeAndExport(
-                        videoURL: work.value.videoURL,
-                        captionMovieParts: captionMovieParts,
-                        outputURL: work.value.outputURL,
-                        cancellationHolder: work.value.cancellationHolder,
-                        progressHandler: progressHandler
-                    )
-                }
+                captionEvents: captionEvents,
+                cancellationHolder: cancellationHolder,
+                temporaryFiles: temporaryFiles
             )
 
+            try await runEmbeddingStep(
+                named: "Captioned movie export",
+                cancellationHolder: cancellationHolder,
+                temporaryFiles: temporaryFiles
+            ) {
+                try await self.composeAndExport(
+                    videoURL: videoURL,
+                    captionMovieParts: captionMovieParts,
+                    outputURL: outputURL,
+                    cancellationHolder: cancellationHolder,
+                    progressHandler: progressHandler
+                )
+            }
+            try Task.checkCancellation()
+            temporaryFiles.remove(captionMovieParts.map(\.url))
+            temporaryFiles.preserve(outputURL)
             logFileSize(at: outputURL, label: "Output")
             log("Caption embedding completed: \(outputURL.lastPathComponent)")
             return outputURL
+        }
+
+        do {
+            guard ownsTimeout else {
+                defer { finishRootOperation() }
+                return try await operation()
+            }
+            return try await CaptionEmbeddingTimeout.run(
+                seconds: totalTimeout,
+                cleanupScheduler: embeddingCleanupScheduler,
+                cleanupPlan: CaptionEmbeddingTimeout.CleanupPlan(
+                    prepare: {
+                        return cancellationHolder.prepareCancellation()
+                    },
+                    perform: { [self] reason in
+                        if reason == .timeout {
+                            log("Caption embedding timed out after \(Int(totalTimeout))s; cancelling AVFoundation work")
+                        }
+                        cancellationHolder.performPreparedCancellation()
+                    }
+                ),
+                discardedSuccessCleanup: { url in
+                    try? FileManager.default.removeItem(at: url)
+                },
+                operationCompletion: finishRootOperation,
+                operation: operation
+            )
         } catch {
             log("Caption embedding aborted: \(error.localizedDescription)")
-            try? fileManager.removeItem(at: outputURL)
             throw error
         }
     }
 
     private nonisolated func writeCaptionTrackMovies(
-        captions: [AVCaption],
-        cancellationHolder: CaptionEmbeddingCancellationHolder
+        captionEvents: [CaptionEvent],
+        cancellationHolder: CaptionEmbeddingCancellationHolder,
+        temporaryFiles: CaptionEmbeddingTemporaryFiles
     ) async throws -> [CaptionMoviePart] {
         var parts: [CaptionMoviePart] = []
-        var temporaryURLs: [URL] = []
 
-        do {
-            let chunkRanges = Self.captionChunkRanges(in: captions, maxCaptionsPerChunk: Self.maxCaptionsPerCaptionMovie)
-            for (chunkIndex, range) in chunkRanges.enumerated() {
-                try Task.checkCancellation()
-                let localized = try Self.localizedCaptionChunk(captions[range])
-                let localizedWork = UncheckedSendableBox(localized)
-                let url = temporaryCaptionURL()
-                try? fileManager.removeItem(at: url)
-                temporaryURLs.append(url)
+        let chunkRanges = Self.captionChunkRanges(
+            in: captionEvents,
+            maxCaptionsPerChunk: Self.maxCaptionsPerCaptionMovie
+        )
+        for (chunkIndex, range) in chunkRanges.enumerated() {
+            try Task.checkCancellation()
+            let localized = try Self.localizedCaptionChunk(captionEvents[range])
+            let url = temporaryCaptionURL()
+            try? FileManager.default.removeItem(at: url)
+            temporaryFiles.register(url)
 
-                log(
-                    "Caption movie chunk \(chunkIndex + 1): writing \(localized.captions.count) caption(s) with timeline offset \(Self.formatLogTimestamp(CMTimeGetSeconds(localized.timelineOffset)))s"
-                )
-                try await CaptionEmbeddingTimeout.run(
-                    seconds: embeddingTimeout,
-                    onTimeout: { [self] in
-                        log(
-                            "Caption movie chunk \(chunkIndex + 1) timed out after \(Int(embeddingTimeout))s; cancelling writer"
-                        )
-                        cancellationHolder.cancel()
-                    },
-                    operation: { [self] in
-                        try await writeCaptionTrackMovie(
-                            captions: localizedWork.value.captions,
-                            to: url,
-                            cancellationHolder: cancellationHolder
-                        )
-                    }
-                )
-                let chunkCaptions = Array(captions[range])
-                guard let firstOriginal = chunkCaptions.first,
-                      let firstLocalized = localized.captions.first else {
-                    continue
-                }
-                parts.append(
-                    CaptionMoviePart(
-                        url: url,
-                        insertTime: firstOriginal.timeRange.start,
-                        sourceTrimStart: firstLocalized.timeRange.start
-                    )
+            log(
+                "Caption movie chunk \(chunkIndex + 1): writing \(localized.events.count) caption(s) with timeline offset \(Self.formatLogTimestamp(CMTimeGetSeconds(localized.timelineOffset)))s"
+            )
+            try await runEmbeddingStep(
+                named: "Caption movie chunk \(chunkIndex + 1)",
+                cancellationHolder: cancellationHolder,
+                temporaryFiles: temporaryFiles
+            ) {
+                try await self.writeCaptionTrackMovie(
+                    captionEvents: localized.events,
+                    to: url,
+                    cancellationHolder: cancellationHolder
                 )
             }
-            return parts
-        } catch {
-            for url in temporaryURLs {
-                try? fileManager.removeItem(at: url)
+            let chunkCaptions = Array(captionEvents[range])
+            guard let firstOriginal = chunkCaptions.first,
+                  let firstLocalized = localized.events.first else {
+                continue
             }
-            throw error
+            parts.append(
+                CaptionMoviePart(
+                    url: url,
+                    insertTime: firstOriginal.timeRange.start,
+                    sourceTrimStart: firstLocalized.timeRange.start
+                )
+            )
         }
+        return parts
+    }
+
+    nonisolated func runEmbeddingStep<Value: Sendable>(
+        named stepName: String,
+        cancellationHolder: CaptionEmbeddingCancellationHolder,
+        temporaryFiles: CaptionEmbeddingTemporaryFiles,
+        operation: @escaping @Sendable () async throws -> Value
+    ) async throws -> Value {
+        let operationLease = temporaryFiles.beginOperation()
+        return try await CaptionEmbeddingTimeout.run(
+            seconds: embeddingStepTimeout,
+            cleanupScheduler: embeddingCleanupScheduler,
+            cleanupPlan: CaptionEmbeddingTimeout.CleanupPlan(
+                prepare: {
+                    return cancellationHolder.prepareCancellation()
+                },
+                perform: { [self] reason in
+                    if reason == .timeout {
+                        log("\(stepName) timed out after \(Int(embeddingStepTimeout))s; cancelling AVFoundation work")
+                    }
+                    cancellationHolder.performPreparedCancellation()
+                }
+            ),
+            operationCompletion: {
+                operationLease.finish()
+            },
+            operation: operation
+        )
     }
 
     private nonisolated func writeCaptionTrackMovie(
-        captions: [AVCaption],
+        captionEvents: [CaptionEvent],
         to url: URL,
         cancellationHolder: CaptionEmbeddingCancellationHolder
     ) async throws {
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
-        cancellationHolder.setWriter(writer)
+        guard cancellationHolder.setWriter(writer) else {
+            throw CancellationError()
+        }
         defer { cancellationHolder.clearWriter(writer) }
+        try Task.checkCancellation()
 
         let captionInput = try makeClosedCaptionInput()
         guard writer.canAdd(captionInput) else {
@@ -202,16 +270,21 @@ nonisolated final class CaptionEmbedder: @unchecked Sendable {
         }
         writer.startSession(atSourceTime: .zero)
 
-        log("Caption movie: appending \(captions.count) caption(s)")
-        for (index, caption) in captions.enumerated() {
+        let conformedCaptions = try makeConformedCaptions(from: captionEvents)
+        logConformedCaptions(count: conformedCaptions.count)
+        log("Caption movie: appending \(conformedCaptions.count) caption(s)")
+        for (index, caption) in conformedCaptions.enumerated() {
             try Task.checkCancellation()
-            log("Caption movie: appending \(index + 1)/\(captions.count)")
+            log("Caption movie: appending \(index + 1)/\(conformedCaptions.count)")
             try await receiver.append(caption)
-            log("Caption movie: appended \(index + 1)/\(captions.count)")
+            log("Caption movie: appended \(index + 1)/\(conformedCaptions.count)")
         }
         receiver.finish()
 
-        try await finishWriting(writer)
+        await writer.finishWriting()
+        guard writer.status == .completed else {
+            throw writer.error ?? CaptionEmbeddingError.cannotStartWriter
+        }
         log("Caption movie written: \(url.lastPathComponent)")
     }
 
@@ -237,22 +310,32 @@ nonisolated final class CaptionEmbedder: @unchecked Sendable {
         export.outputURL = outputURL
         export.outputFileType = .mov
         export.shouldOptimizeForNetworkUse = false
-        cancellationHolder.setExportSession(export)
+        guard cancellationHolder.setExportSession(export) else {
+            throw CancellationError()
+        }
         defer { cancellationHolder.clearExportSession(export) }
+        try Task.checkCancellation()
 
         log("Exporting captioned movie (passthrough, no network optimization)")
-        let progressWork = UncheckedSendableBox((export: export, progressHandler: progressHandler))
         let progressTask = Task { @concurrent in
             while !Task.isCancelled {
-                progressWork.value.progressHandler?(progressWork.value.export.progress)
-                if progressWork.value.export.progress >= 1 {
+                guard let progress = cancellationHolder.exportProgress() else { break }
+                progressHandler?(progress)
+                if progress >= 1 {
                     break
                 }
                 try? await Task.sleep(for: .milliseconds(100))
             }
         }
-        defer { progressTask.cancel() }
-        try await export.export(to: outputURL, as: .mov)
+        do {
+            try await export.export(to: outputURL, as: .mov)
+        } catch {
+            progressTask.cancel()
+            await progressTask.value
+            throw error
+        }
+        progressTask.cancel()
+        await progressTask.value
         progressHandler?(1)
         log("Export completed")
     }
@@ -336,34 +419,28 @@ nonisolated final class CaptionEmbedder: @unchecked Sendable {
         }
     }
 
-    private nonisolated func finishWriting(_ writer: AVAssetWriter) async throws {
-        await withCheckedContinuation { continuation in
-            writer.finishWriting {
-                continuation.resume()
-            }
-        }
-
-        guard writer.status == .completed else {
-            throw writer.error ?? CaptionEmbeddingError.cannotStartWriter
-        }
-    }
-
     nonisolated func makeClosedCaptions(
         from segments: [CaptionSegment],
         frameDuration: CMTime = CaptionEmbedder.defaultFrameDuration,
         maxTimelineEnd: CMTime? = nil
     ) throws -> [AVCaption] {
-        let captions = makeCanonicalCaptions(
+        let captionEvents = makeCanonicalCaptionEvents(
             from: segments,
             frameDuration: frameDuration,
             maxTimelineEnd: maxTimelineEnd
         )
-        guard !captions.isEmpty else { return [] }
+        return try makeConformedCaptions(from: captionEvents, frameDuration: frameDuration)
+    }
 
+    private nonisolated func makeConformedCaptions(
+        from captionEvents: [CaptionEvent],
+        frameDuration: CMTime = CaptionEmbedder.defaultFrameDuration
+    ) throws -> [AVCaption] {
         let conformer = Self.makeCaptionConformer(frameDuration: frameDuration)
 
-        return try captions.map { caption in
+        return try captionEvents.map { event in
             do {
+                let caption = AVCaption(event.text, timeRange: event.timeRange)
                 return try conformer.conformedCaption(for: caption)
             } catch {
                 CaptionLogger.error("Failed to conform caption to CEA-608: \(error.localizedDescription)")
@@ -377,12 +454,12 @@ nonisolated final class CaptionEmbedder: @unchecked Sendable {
         return try await asset.load(.duration)
     }
 
-    private nonisolated func makeCanonicalCaptions(
+    private nonisolated func makeCanonicalCaptionEvents(
         from segments: [CaptionSegment],
-        frameDuration: CMTime,
+        frameDuration: CMTime = CaptionEmbedder.defaultFrameDuration,
         maxTimelineEnd: CMTime? = nil
-    ) -> [AVCaption] {
-        var captions: [AVCaption] = []
+    ) -> [CaptionEvent] {
+        var captionEvents: [CaptionEvent] = []
         var previousEnd = CMTime.zero
 
         for segment in segments.sorted(by: { $0.startTime < $1.startTime }) {
@@ -444,13 +521,13 @@ nonisolated final class CaptionEmbedder: @unchecked Sendable {
                 )
                 for timeRange in timeRanges {
                     guard Self.isValidCaptionTimeRange(timeRange) else { continue }
-                    captions.append(AVCaption(chunk, timeRange: timeRange))
+                    captionEvents.append(CaptionEvent(text: chunk, timeRange: timeRange))
                     previousEnd = timeRange.end
                 }
             }
         }
 
-        return captions
+        return captionEvents
     }
 
     private nonisolated func makeClosedCaptionInput() throws -> AVAssetWriterInput {
@@ -482,12 +559,12 @@ nonisolated final class CaptionEmbedder: @unchecked Sendable {
         log("Prepared \(segments.count) caption segment(s) for embedding")
     }
 
-    private nonisolated func logConformedCaptions(_ captions: [AVCaption]) {
-        log("Conformed \(captions.count) caption event(s)")
+    private nonisolated func logConformedCaptions(count: Int) {
+        log("Conformed \(count) caption event(s)")
     }
 
     private nonisolated func logFileSize(at url: URL, label: String) {
-        guard let attributes = try? fileManager.attributesOfItem(atPath: url.path),
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
               let size = attributes[.size] as? Int64 else {
             log("\(label) file size: unavailable")
             return
@@ -500,21 +577,15 @@ nonisolated final class CaptionEmbedder: @unchecked Sendable {
     }
 
     private nonisolated func temporaryOutputURL() -> URL {
-        fileManager.temporaryDirectory
+        FileManager.default.temporaryDirectory
             .appendingPathComponent("Recording-\(UUID().uuidString)")
             .appendingPathExtension("mov")
     }
 
     private nonisolated func temporaryCaptionURL() -> URL {
-        fileManager.temporaryDirectory
+        FileManager.default.temporaryDirectory
             .appendingPathComponent("Captions-\(UUID().uuidString)")
             .appendingPathExtension("mov")
-    }
-
-    private nonisolated func removeCaptionMovieParts(_ parts: [CaptionMoviePart]) {
-        for part in parts {
-            try? fileManager.removeItem(at: part.url)
-        }
     }
 
     private nonisolated static func isValidCaptionTimeRange(_ range: CMTimeRange) -> Bool {
@@ -586,9 +657,19 @@ nonisolated final class CaptionEmbedder: @unchecked Sendable {
         in captions: [AVCaption],
         maxCaptionsPerChunk: Int
     ) -> [Range<Int>] {
-        guard !captions.isEmpty else { return [] }
+        captionChunkRanges(
+            in: captions.map { CaptionEvent(text: $0.text, timeRange: $0.timeRange) },
+            maxCaptionsPerChunk: maxCaptionsPerChunk
+        )
+    }
 
-        let count = captions.count
+    private nonisolated static func captionChunkRanges(
+        in captionEvents: [CaptionEvent],
+        maxCaptionsPerChunk: Int
+    ) -> [Range<Int>] {
+        guard !captionEvents.isEmpty else { return [] }
+
+        let count = captionEvents.count
         let chunkCount = (count + maxCaptionsPerChunk - 1) / maxCaptionsPerChunk
         var chunkSizes = Array(repeating: count / chunkCount, count: chunkCount)
         let remainder = count % chunkCount
@@ -601,18 +682,28 @@ nonisolated final class CaptionEmbedder: @unchecked Sendable {
         }
 
         var ranges: [Range<Int>] = []
-        var chunkStart = captions.startIndex
+        var chunkStart = captionEvents.startIndex
 
         for (chunkIndex, targetSize) in chunkSizes.enumerated() {
-            guard chunkStart < captions.endIndex else { break }
+            guard chunkStart < captionEvents.endIndex else { break }
 
             let isLastChunk = chunkIndex == chunkSizes.count - 1
             var chunkEnd = isLastChunk
-                ? captions.endIndex
-                : captions.index(chunkStart, offsetBy: targetSize, limitedBy: captions.endIndex) ?? captions.endIndex
+                ? captionEvents.endIndex
+                : captionEvents.index(
+                    chunkStart,
+                    offsetBy: targetSize,
+                    limitedBy: captionEvents.endIndex
+                ) ?? captionEvents.endIndex
 
-            if !isLastChunk, chunkEnd < captions.endIndex, chunkStart < captions.index(before: chunkEnd) {
-                chunkEnd = preferredSplitIndex(in: captions, chunkStart: chunkStart, defaultEnd: chunkEnd)
+            if !isLastChunk,
+               chunkEnd < captionEvents.endIndex,
+               chunkStart < captionEvents.index(before: chunkEnd) {
+                chunkEnd = preferredSplitIndex(
+                    in: captionEvents,
+                    chunkStart: chunkStart,
+                    defaultEnd: chunkEnd
+                )
             }
 
             ranges.append(chunkStart..<chunkEnd)
@@ -623,7 +714,7 @@ nonisolated final class CaptionEmbedder: @unchecked Sendable {
     }
 
     private nonisolated static func preferredSplitIndex(
-        in captions: [AVCaption],
+        in captionEvents: [CaptionEvent],
         chunkStart: Int,
         defaultEnd: Int
     ) -> Int {
@@ -633,7 +724,7 @@ nonisolated final class CaptionEmbedder: @unchecked Sendable {
         var bestGap = -Double.infinity
         var index = chunkStart + 1
         while index < defaultEnd {
-            let gap = gapBetween(captions[index - 1], captions[index])
+            let gap = gapBetween(captionEvents[index - 1], captionEvents[index])
             if gap > bestGap {
                 bestGap = gap
                 bestSplit = index
@@ -647,14 +738,17 @@ nonisolated final class CaptionEmbedder: @unchecked Sendable {
         return defaultEnd
     }
 
-    private nonisolated static func gapBetween(_ previous: AVCaption, _ next: AVCaption) -> TimeInterval {
+    private nonisolated static func gapBetween(
+        _ previous: CaptionEvent,
+        _ next: CaptionEvent
+    ) -> TimeInterval {
         CMTimeGetSeconds(CMTimeSubtract(next.timeRange.start, previous.timeRange.end))
     }
 
     private nonisolated static func localizedCaptionChunk(
-        _ captions: ArraySlice<AVCaption>
-    ) throws -> (timelineOffset: CMTime, captions: [AVCaption]) {
-        guard let firstCaption = captions.first else {
+        _ captionEvents: ArraySlice<CaptionEvent>
+    ) throws -> (timelineOffset: CMTime, events: [CaptionEvent]) {
+        guard let firstCaption = captionEvents.first else {
             return (.zero, [])
         }
 
@@ -674,12 +768,12 @@ nonisolated final class CaptionEmbedder: @unchecked Sendable {
         }
 
         let localizationOffset = max(firstCaption.timeRange.start - sourceStartTime, .zero)
-        let localizedCaptions = captions.map { caption in
+        let localizedEvents = captionEvents.map { caption in
             let localStart = caption.timeRange.start - localizationOffset
             let localRange = CMTimeRange(start: localStart, duration: caption.timeRange.duration)
-            return AVCaption(caption.text, timeRange: localRange)
+            return CaptionEvent(text: caption.text, timeRange: localRange)
         }
-        return (localizationOffset, localizedCaptions)
+        return (localizationOffset, localizedEvents)
     }
 
     private nonisolated static func makeCaptionConformer(
