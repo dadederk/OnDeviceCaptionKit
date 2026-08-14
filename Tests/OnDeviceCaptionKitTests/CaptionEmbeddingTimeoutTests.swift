@@ -237,11 +237,16 @@ struct CaptionEmbeddingTimeoutTests {
         }
     }
 
-    @Test("Timeout return is independent of slow cleanup")
+    @Test(
+        "Timeout return is independent of slow cleanup",
+        .timeLimit(.minutes(1))
+    )
     func givenSlowCleanupWhenTimingOutThenCallerReturnsFirst() async throws {
+        let cleanupGate = DispatchSemaphore(value: 0)
+        let cleanupStarted = LockedFlag()
         let cleanupFinished = LockedFlag()
-        let start = ContinuousClock.now
         let cleanupScheduler = CaptionEmbeddingTimeout.CleanupScheduler()
+        defer { cleanupGate.signal() }
 
         do {
             _ = try await CaptionEmbeddingTimeout.run(
@@ -251,7 +256,8 @@ struct CaptionEmbeddingTimeoutTests {
                     prepare: { true },
                     perform: { reason in
                         #expect(reason == .timeout)
-                        Thread.sleep(forTimeInterval: 0.5)
+                        cleanupStarted.set()
+                        cleanupGate.wait()
                         cleanupFinished.set()
                     }
                 ),
@@ -263,8 +269,12 @@ struct CaptionEmbeddingTimeoutTests {
             Issue.record("Expected embedding timeout")
         } catch let error as CaptionEmbeddingError {
             if case .timedOut = error {
-                #expect(start.duration(to: .now) < .milliseconds(250))
+                for _ in 0..<1_000 where !cleanupStarted.value {
+                    try? await Task.sleep(for: .milliseconds(1))
+                }
+                #expect(cleanupStarted.value)
                 #expect(!cleanupFinished.value)
+                cleanupGate.signal()
                 for _ in 0..<1_000 where !cleanupFinished.value {
                     try? await Task.sleep(for: .milliseconds(1))
                 }
