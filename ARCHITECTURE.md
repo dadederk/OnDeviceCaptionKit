@@ -17,8 +17,10 @@ CaptionPipeline
    |       +--> LegacySpeechProvider (SFSpeechRecognizer)
    |
    +--> writeSRT(segments:besideVideoAt:) async
+   +--> writeSRT(tracks:besideVideoAt:) async
    |
    +--> exportCaptions(segments:videoURL:format:)
+   +--> exportCaptions(tracks:videoURL:format:)
 ```
 
 The pipeline coordinates transcription and export while keeping UI, localization copy, file pickers, recording, and fallback messaging in the consuming app.
@@ -72,6 +74,24 @@ CaptionSegment array
            |
            v
        CEA-608 caption events in .mov
+
+CaptionLanguageTrack array
+   |
+   +--> SRTWriter
+   |       |
+   |       v
+   |   Atomically adopted UTF-8 SRT bundle
+   |
+   +--> Tx3gCaptionTrackWriter
+           |
+           v
+       Unicode text tracks
+           |
+           v
+       Grouped writer with direct compressed video/audio sample forwarding
+           |
+           v
+       Tx3gCaptionTrackReader validation
 ```
 
 SRT writing owns timestamp formatting and text wrapping. MOV embedding owns CEA-608 event preparation and AVFoundation muxing.
@@ -87,6 +107,12 @@ MOV embedding fails
    v
 CaptionExportResult keeps original videoURL
 and returns deferredSRTSegments
+
+Multilingual MOV embedding fails
+   |
+   v
+CaptionExportResult keeps original videoURL
+and returns every nonempty deferredSRTTrack
 ```
 
 The package preserves enough structured output for host apps to offer a sidecar fallback without losing successful transcription work.

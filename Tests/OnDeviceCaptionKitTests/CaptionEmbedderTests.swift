@@ -348,6 +348,46 @@ struct CaptionEmbedderTests {
     }
 
     @Test(
+        "Unicode caption muxer preserves compressed video and audio samples",
+        .timeLimit(.minutes(1))
+    )
+    func givenMOVWithAudioWhenEmbeddingUnicodeTracksThenSamplesAndCaptionsRoundTrip() async throws {
+        let sourceURL = try await makeTinyMOV(includeAudio: true)
+        defer { try? FileManager.default.removeItem(at: sourceURL) }
+        let original = try CaptionLanguageTrack(
+            languageIdentifier: "en-US",
+            segments: [
+                CaptionSegment(index: 1, startTime: 0.125, endTime: 0.375, text: "Hello 👋\n中文"),
+                CaptionSegment(index: 2, startTime: 0.501, endTime: 0.899, text: "Second line"),
+            ]
+        )
+        let arabic = try CaptionLanguageTrack(
+            languageIdentifier: "ar-SA",
+            segments: [
+                CaptionSegment(index: 1, startTime: 0.125, endTime: 0.375, text: "مرحبًا 👋"),
+                CaptionSegment(index: 2, startTime: 0.501, endTime: 0.899, text: "سطران\nمن النص"),
+            ]
+        )
+        let sourceVideoSamples = try await compressedSamplePayloads(in: sourceURL, mediaType: .video)
+        let sourceAudioSamples = try await compressedSamplePayloads(in: sourceURL, mediaType: .audio)
+
+        let outputURL = try await UnicodeCaptionEmbedder().embed(
+            tracks: [original, arabic],
+            into: sourceURL
+        )
+        defer { try? FileManager.default.removeItem(at: outputURL) }
+
+        #expect(try await Tx3gCaptionTrackReader().read(from: outputURL) == [original, arabic])
+        #expect(try await compressedSamplePayloads(in: outputURL, mediaType: .video) == sourceVideoSamples)
+        #expect(try await compressedSamplePayloads(in: outputURL, mediaType: .audio) == sourceAudioSamples)
+        let selectionGroup = try await AVURLAsset(url: outputURL).loadMediaSelectionGroup(for: .legible)
+        let selectableLanguages = Set(
+            selectionGroup?.options.compactMap { $0.locale?.identifier } ?? []
+        )
+        #expect(selectableLanguages.isSuperset(of: ["en-US", "ar-SA"]))
+    }
+
+    @Test(
         "Caption muxer embeds captions into an export-session muxed MOV without deadlocking",
         .timeLimit(.minutes(1))
     )
@@ -744,6 +784,55 @@ struct CaptionEmbedderTests {
     private func waitUntilReady(_ input: AVAssetWriterInput) async throws {
         for _ in 0..<100 where !input.isReadyForMoreMediaData {
             try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    @available(macOS 26, *)
+    private func compressedSamplePayloads(
+        in url: URL,
+        mediaType: AVMediaType
+    ) async throws -> [[Data]] {
+        let asset = AVURLAsset(url: url)
+        let tracks = try await asset.loadTracks(withMediaType: mediaType)
+        var payloads: [[Data]] = []
+        for track in tracks {
+            let reader = try AVAssetReader(asset: asset)
+            let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+            guard reader.canAdd(output) else { throw CaptionEmbeddingTestError.cannotStartReader }
+            let provider = reader.outputProvider(for: output)
+            guard reader.startReading() else {
+                throw reader.error ?? CaptionEmbeddingTestError.cannotStartReader
+            }
+            var trackPayloads: [Data] = []
+            while let sample = try await provider.next() {
+                guard case .dataBuffer(let dataBuffer) = sample.content else { continue }
+                trackPayloads.append(try sampleData(from: dataBuffer))
+            }
+            guard reader.status == .completed else {
+                throw reader.error ?? CaptionEmbeddingTestError.readerFailed
+            }
+            payloads.append(trackPayloads)
+        }
+        return payloads
+    }
+
+    @available(macOS 26, *)
+    private func sampleData(from dataBuffer: CMReadOnlyDataBlockBuffer) throws -> Data {
+        try dataBuffer.withUnsafeBlockBuffer { blockBuffer in
+            let count = CMBlockBufferGetDataLength(blockBuffer)
+            guard count > 0 else { return Data() }
+            var data = Data(count: count)
+            let status = data.withUnsafeMutableBytes { destination -> OSStatus in
+                guard let baseAddress = destination.baseAddress else { return -1 }
+                return CMBlockBufferCopyDataBytes(
+                    blockBuffer,
+                    atOffset: 0,
+                    dataLength: count,
+                    destination: baseAddress
+                )
+            }
+            guard status == noErr else { throw CaptionEmbeddingTestError.readerFailed }
+            return data
         }
     }
 

@@ -138,4 +138,51 @@ struct SRTWriterTests {
         #expect(srtContent.contains(wrappedText))
         #expect(wrappedText.contains("\n"))
     }
+
+    @Test("Multilingual SRT bundle uses canonical language suffixes")
+    func givenLanguageTracksWhenWritingBundleThenOriginalAndTranslationsUseCanonicalNames() async throws {
+        let directoryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SRTWriterTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+        let videoURL = directoryURL.appendingPathComponent("Recording.mov")
+        let tracks = [
+            try CaptionLanguageTrack(
+                languageIdentifier: "en-US",
+                segments: [CaptionSegment(index: 1, startTime: 0, endTime: 1, text: "Hello")]
+            ),
+            try CaptionLanguageTrack(
+                languageIdentifier: "es-ES",
+                segments: [CaptionSegment(index: 1, startTime: 0, endTime: 1, text: "Hola")]
+            ),
+        ]
+
+        let urls = try await SRTWriter().generateSRTBundle(from: tracks, besideVideoAt: videoURL)
+
+        #expect(urls.map(\.lastPathComponent) == ["Recording.srt", "Recording.es-ES.srt"])
+        #expect(try String(contentsOf: urls[0], encoding: .utf8).contains("Hello"))
+        #expect(try String(contentsOf: urls[1], encoding: .utf8).contains("Hola"))
+    }
+
+    @Test("Cancelled SRT bundle adoption preserves existing sidecars")
+    func givenCancellationBeforeBundleWriteThenExistingSidecarIsUntouched() async throws {
+        let directoryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SRTWriterTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+        let videoURL = directoryURL.appendingPathComponent("Recording.mov")
+        let existingURL = directoryURL.appendingPathComponent("Recording.srt")
+        try "Existing".write(to: existingURL, atomically: true, encoding: .utf8)
+        let track = try CaptionLanguageTrack(
+            languageIdentifier: "en-US",
+            segments: [CaptionSegment(index: 1, startTime: 0, endTime: 1, text: "Replacement")]
+        )
+
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await SRTWriter().generateSRTBundle(from: [track], besideVideoAt: videoURL)
+        }
+        await #expect(throws: CancellationError.self) { try await task.value }
+        #expect(try String(contentsOf: existingURL, encoding: .utf8) == "Existing")
+    }
 }

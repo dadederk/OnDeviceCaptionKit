@@ -23,6 +23,7 @@ public struct CaptionPipeline: Sendable {
     private let legacyProvider: any CaptionRecognitionProvider
     private let srtWriter: SRTWriter
     private let embedder: any CaptionEmbeddingMuxing
+    private let unicodeEmbedder: any UnicodeCaptionEmbeddingMuxing
     private let embeddingTimeoutMargin: TimeInterval
     private let embeddingCleanupScheduler: CaptionEmbeddingTimeout.CleanupScheduler
     private let discardedCaptionOutputCleanup: @Sendable (URL) -> Void
@@ -34,6 +35,7 @@ public struct CaptionPipeline: Sendable {
         self.init(
             configuration: configuration,
             embedder: nil,
+            unicodeEmbedder: nil,
             srtWriter: nil,
             embeddingTimeoutMargin: embeddingTimeoutMargin
         )
@@ -42,6 +44,7 @@ public struct CaptionPipeline: Sendable {
     init(
         configuration: Configuration = Configuration(),
         embedder: (any CaptionEmbeddingMuxing)? = nil,
+        unicodeEmbedder: (any UnicodeCaptionEmbeddingMuxing)? = nil,
         srtWriter: SRTWriter? = nil,
         embeddingTimeoutMargin: TimeInterval = 2,
         modernProvider: (any CaptionRecognitionProvider)? = nil,
@@ -62,6 +65,7 @@ public struct CaptionPipeline: Sendable {
         } else {
             self.embedder = CaptionEmbedder(locale: configuration.transcription.locale)
         }
+        self.unicodeEmbedder = unicodeEmbedder ?? UnicodeCaptionEmbedder()
         self.embeddingTimeoutMargin = embeddingTimeoutMargin
         self.embeddingCleanupScheduler = embeddingCleanupScheduler
         self.discardedCaptionOutputCleanup = discardedCaptionOutputCleanup
@@ -80,6 +84,7 @@ public struct CaptionPipeline: Sendable {
                 assetsPrepared: assetsPrepared
             ),
             embedder: nil,
+            unicodeEmbedder: nil,
             srtWriter: nil,
             embeddingTimeoutMargin: embeddingTimeoutMargin
         )
@@ -90,6 +95,7 @@ public struct CaptionPipeline: Sendable {
         speechAuthorizationProvider: any SpeechAuthorizationProviding = SystemSpeechAuthorizationProvider(),
         assetsPrepared: Bool = false,
         embedder: (any CaptionEmbeddingMuxing)? = nil,
+        unicodeEmbedder: (any UnicodeCaptionEmbeddingMuxing)? = nil,
         srtWriter: SRTWriter? = nil,
         embeddingTimeoutMargin: TimeInterval = 2
     ) {
@@ -100,6 +106,7 @@ public struct CaptionPipeline: Sendable {
                 assetsPrepared: assetsPrepared
             ),
             embedder: embedder,
+            unicodeEmbedder: unicodeEmbedder,
             srtWriter: srtWriter,
             embeddingTimeoutMargin: embeddingTimeoutMargin
         )
@@ -206,6 +213,87 @@ public struct CaptionPipeline: Sendable {
         }
     }
 
+    @concurrent
+    public func exportCaptions(
+        tracks: [CaptionLanguageTrack],
+        videoURL: URL,
+        format: CaptionOutputFormat,
+        progressHandler: (@Sendable (Float) -> Void)? = nil
+    ) async throws -> CaptionExportResult {
+        try Task.checkCancellation()
+        try CaptionLanguageTrack.validateCollection(tracks)
+        let originalSegments = tracks.first?.segments ?? []
+        let hasNonemptyTranslation = tracks.dropFirst().contains { track in
+            track.segments.contains {
+                !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+        }
+        guard hasNonemptyTranslation else {
+            return try await exportCaptions(
+                segments: originalSegments,
+                videoURL: videoURL,
+                format: format,
+                progressHandler: progressHandler
+            )
+        }
+        let nonemptyTracks = tracks.filter { track in
+            track.segments.contains {
+                !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+        }
+
+        switch format {
+        case .embeddedMovCaptions:
+            do {
+                let timeoutBudget = try await unicodeEmbedder.estimatedEmbeddingTimeout(
+                    for: nonemptyTracks,
+                    into: videoURL
+                ) + embeddingTimeoutMargin
+                let captionedURL = try await CaptionEmbeddingTimeout.run(
+                    seconds: timeoutBudget,
+                    cleanupScheduler: embeddingCleanupScheduler,
+                    cleanupPlan: CaptionEmbeddingTimeout.CleanupPlan(
+                        prepare: { true },
+                        perform: { reason in
+                            if reason == .timeout {
+                                CaptionLogger.warning("Unicode caption embedding timed out at export boundary")
+                            }
+                        }
+                    ),
+                    discardedSuccessCleanup: discardedCaptionOutputCleanup,
+                    operation: {
+                        try await self.unicodeEmbedder.embedUnicodeCaptions(
+                            from: nonemptyTracks,
+                            into: videoURL,
+                            progressHandler: progressHandler
+                        )
+                    }
+                )
+                return CaptionExportResult(
+                    videoURL: captionedURL,
+                    segments: originalSegments
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                CaptionLogger.error("Unicode caption embedding failed: \(error.localizedDescription)")
+                return CaptionExportResult(
+                    videoURL: videoURL,
+                    segments: originalSegments,
+                    deferredSRTTracks: nonemptyTracks.isEmpty ? nil : nonemptyTracks,
+                    warningCode: nonemptyTracks.isEmpty ? "embeddedFailed" : "embeddedFallbackToSRT"
+                )
+            }
+
+        case .srtSidecar:
+            return CaptionExportResult(
+                videoURL: videoURL,
+                segments: originalSegments,
+                deferredSRTTracks: nonemptyTracks.isEmpty ? nil : nonemptyTracks
+            )
+        }
+    }
+
     @available(*, deprecated, message: "Use the async writeSRT overload.")
     public func writeSRT(segments: [CaptionSegment], besideVideoAt videoURL: URL) throws {
         let outputURL = srtWriter.srtURLBesideVideo(videoURL)
@@ -226,6 +314,15 @@ public struct CaptionPipeline: Sendable {
     @concurrent
     public func writeSRT(segments: [CaptionSegment], to outputURL: URL) async throws {
         try await srtWriter.generateSRTFile(from: segments, to: outputURL)
+    }
+
+    @concurrent
+    public func writeSRT(
+        tracks: [CaptionLanguageTrack],
+        besideVideoAt videoURL: URL
+    ) async throws -> [URL] {
+        try CaptionLanguageTrack.validateCollection(tracks)
+        return try await srtWriter.generateSRTBundle(from: tracks, besideVideoAt: videoURL)
     }
 
     private func transcribeWithModernProvider(

@@ -5,7 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-08-14
+
+### Added
+- Added `CaptionLanguageTrack` with canonical BCP-47 language identifiers and validated monotonic segments.
+- Added multilingual Unicode `tx3g` MOV export through `CaptionPipeline.exportCaptions(tracks:videoURL:format:progressHandler:)`.
+- Added `CaptionExportResult.deferredSRTTracks` so every nonempty language falls back together when Unicode embedding fails.
+- Added atomic multilingual SRT bundles with canonical language suffixes through `CaptionPipeline.writeSRT(tracks:besideVideoAt:)`.
+
+### Changed
+- Unicode MOV export validates exact language tags, text, and millisecond timing before returning the staged movie.
+- Multilingual MOV muxing forwards compressed video and audio sample buffers through one grouped AVAssetWriter pass without re-encoding.
+- Existing single-language APIs continue to use the CEA-608/SRT compatibility pipeline.
+
+### Fixed
+- Split modern time-indexed finalized passages into readable cues while preserving their exact attributed audio ranges.
+- Failed modern recognition atomically when any recognized nonblank run lacks valid timing instead of collapsing or dropping transcript text.
+- Preserved short legacy-recognizer speech that was previously discarded, restored pause boundaries, and based cue ranges on recognized-word timing instead of surrounding silence.
+- Bounded legacy cues by duration and readable text length without dropping recognized words.
 
 ## [0.2.1] - 2026-08-12
 

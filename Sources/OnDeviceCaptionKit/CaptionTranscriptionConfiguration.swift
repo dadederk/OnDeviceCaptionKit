@@ -33,6 +33,7 @@ public struct CaptionExportResult: Equatable, Sendable {
     public let videoURL: URL
     public let segments: [CaptionSegment]
     public let deferredSRTSegments: [CaptionSegment]?
+    public let deferredSRTTracks: [CaptionLanguageTrack]?
     public let warningCode: String?
     public let providerID: CaptionRecognitionProviderID?
 
@@ -40,12 +41,14 @@ public struct CaptionExportResult: Equatable, Sendable {
         videoURL: URL,
         segments: [CaptionSegment],
         deferredSRTSegments: [CaptionSegment]? = nil,
+        deferredSRTTracks: [CaptionLanguageTrack]? = nil,
         warningCode: String? = nil,
         providerID: CaptionRecognitionProviderID? = nil
     ) {
         self.videoURL = videoURL
         self.segments = segments
         self.deferredSRTSegments = deferredSRTSegments
+        self.deferredSRTTracks = deferredSRTTracks
         self.warningCode = warningCode
         self.providerID = providerID
     }

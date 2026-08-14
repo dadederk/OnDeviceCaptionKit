@@ -9,13 +9,14 @@
 [![CI](https://github.com/dadederk/OnDeviceCaptionKit/actions/workflows/ondevicecaptionkit-tests.yml/badge.svg)](https://github.com/dadederk/OnDeviceCaptionKit/actions/workflows/ondevicecaptionkit-tests.yml)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-On-device caption transcription, SRT export, and CEA-608 MOV closed-caption embedding for Swift apps on macOS.
+On-device caption transcription, multilingual SRT export, and selectable MOV caption embedding for Swift apps on macOS.
 
 OnDeviceCaptionKit provides:
 - On-device speech transcription through Apple's Speech framework.
 - Modern `SpeechAnalyzer` transcription with legacy `SFSpeechRecognizer` fallback.
 - SRT sidecar generation with deterministic timestamp and text wrapping behavior.
 - CEA-608 closed-caption embedding for `.mov` files using AVFoundation.
+- Unicode `tx3g` MOV embedding with multiple selectable BCP-47 language tracks.
 - Typed errors and stable warning codes for host-app localization.
 
 v1 scope is caption generation and export only. UI, localization copy, save panels, settings, logging policy, microphone capture, screen recording, and user-facing fallback messaging stay in the consuming app.
@@ -34,7 +35,7 @@ Add OnDeviceCaptionKit to your `Package.swift` dependencies:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/dadederk/OnDeviceCaptionKit.git", from: "0.2.0")
+    .package(url: "https://github.com/dadederk/OnDeviceCaptionKit.git", from: "0.3.0")
 ]
 ```
 
@@ -89,6 +90,20 @@ let export = try await pipeline.exportCaptions(
 let captionedVideoURL = export.videoURL
 ```
 
+Embed multiple Unicode caption tracks without re-encoding video or audio:
+
+```swift
+let tracks = [
+    try CaptionLanguageTrack(languageIdentifier: "en-US", segments: originalSegments),
+    try CaptionLanguageTrack(languageIdentifier: "es-ES", segments: spanishSegments),
+]
+let export = try await pipeline.exportCaptions(
+    tracks: tracks,
+    videoURL: videoURL,
+    format: .embeddedMovCaptions
+)
+```
+
 Asset consent example:
 
 ```swift
@@ -106,10 +121,11 @@ if let requirement = await CaptionPipelineCapabilities.requiresAssetDownload(for
 - `CaptionPipeline`: transcribe, export, and write-SRT orchestration.
 - `CaptionPipeline.Configuration`: host-app configuration for transcription, authorization, and prepared speech assets.
 - `CaptionSegment`: timed caption text with start/end times.
+- `CaptionLanguageTrack`: one validated Unicode caption track with a canonical BCP-47 tag.
 - `CaptionTranscriptionConfiguration`: locale, asset policy, transcript debug logging, and provider preference.
 - `CaptionTranscriptionResult`: transcript segments plus the provider that produced them.
 - `CaptionOutputFormat`: `.embeddedMovCaptions` or `.srtSidecar`.
-- `CaptionExportResult`: exported video URL, source segments, deferred SRT segments, and warning code.
+- `CaptionExportResult`: exported video URL, source segments, deferred single- or multilingual SRT values, and warning code.
 - `CaptionError`: stable error cases and `code` strings for host-app localization.
 - `CaptionPipelineCapabilities`: provider, locale, and asset-download capability helpers.
 - `SpeechAuthorizationProviding`: injectable speech authorization boundary for apps and tests.
@@ -127,11 +143,15 @@ Cancelling transcription or caption export propagates `CancellationError`. Capti
 
 ## Caption Export Behavior
 
-- Embedded `.mov` captions use CEA-608 closed captions.
+- The single-language compatibility API embeds CEA-608 closed captions.
+- The multilingual API embeds Unicode `tx3g` tracks with exact extended language tags and validates them before returning.
+- Multilingual embedding forwards compressed video and audio sample buffers without re-encoding them.
 - Empty or whitespace-only caption text is skipped.
 - Long caption text is split into row-sized CEA-608 events so AVFoundation does not silently truncate it.
 - If MOV embedding fails after transcription succeeds, `CaptionExportResult` preserves the original video URL and returns deferred SRT segments so the host app can offer a fallback file.
+- If multilingual MOV embedding fails, every nonempty language is returned in `deferredSRTTracks`; the package never adopts a partial track set.
 - SRT output is UTF-8, uses `HH:MM:SS,mmm` timestamps, and avoids an extra trailing blank separator.
+- Multilingual SRT bundles use the original video basename plus canonical suffixes such as `Recording.es-ES.srt` and stage the complete bundle before replacing sidecars.
 
 ## Architecture
 

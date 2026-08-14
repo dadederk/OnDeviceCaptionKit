@@ -242,12 +242,126 @@ struct CaptionPipelineExportTests {
         }
     }
 
+    @Test("Multilingual embedded export forwards every track atomically")
+    func givenLanguageTracksWhenEmbeddingThenUnicodeMuxerReceivesAllTracks() async throws {
+        let sourceURL = URL(fileURLWithPath: "/tmp/source.mov")
+        let captionedURL = URL(fileURLWithPath: "/tmp/captioned.mov")
+        let tracks = try sampleLanguageTracks()
+        let unicodeMuxer = StubUnicodeCaptionMuxer(result: .success(captionedURL))
+        let pipeline = makePipeline(
+            embedder: StubCaptionMuxer(result: .failure(.unexpectedCaptionMux)),
+            unicodeEmbedder: unicodeMuxer
+        )
+
+        let result = try await pipeline.exportCaptions(
+            tracks: tracks,
+            videoURL: sourceURL,
+            format: .embeddedMovCaptions
+        )
+
+        #expect(result.videoURL == captionedURL)
+        #expect(result.segments == tracks[0].segments)
+        #expect(result.deferredSRTTracks == nil)
+        #expect(unicodeMuxer.receivedTracks == tracks)
+    }
+
+    @Test("Multilingual MOV failure defers every nonempty language to SRT")
+    func givenUnicodeMuxFailureWhenExportingThenAllTracksFallBackTogether() async throws {
+        let sourceURL = URL(fileURLWithPath: "/tmp/source.mov")
+        let tracks = try sampleLanguageTracks()
+        let pipeline = makePipeline(
+            embedder: StubCaptionMuxer(result: .failure(.unexpectedCaptionMux)),
+            unicodeEmbedder: StubUnicodeCaptionMuxer(result: .failure(.captionMuxFailed))
+        )
+
+        let result = try await pipeline.exportCaptions(
+            tracks: tracks,
+            videoURL: sourceURL,
+            format: .embeddedMovCaptions
+        )
+
+        #expect(result.videoURL == sourceURL)
+        #expect(result.deferredSRTTracks == tracks)
+        #expect(result.warningCode == "embeddedFallbackToSRT")
+    }
+
+    @Test("Multilingual exports reject duplicate BCP-47 language tracks")
+    func givenDuplicateLanguagesWhenExportingThenValidationFailsBeforeMuxing() async throws {
+        let track = try #require(try sampleLanguageTracks().first)
+        let unicodeMuxer = StubUnicodeCaptionMuxer(result: .success(URL(fileURLWithPath: "/tmp/output.mov")))
+        let pipeline = makePipeline(
+            embedder: StubCaptionMuxer(result: .failure(.unexpectedCaptionMux)),
+            unicodeEmbedder: unicodeMuxer
+        )
+
+        await #expect(throws: CaptionLanguageTrackError.duplicateLanguageIdentifier("en-US")) {
+            try await pipeline.exportCaptions(
+                tracks: [track, track],
+                videoURL: URL(fileURLWithPath: "/tmp/source.mov"),
+                format: .embeddedMovCaptions
+            )
+        }
+        #expect(unicodeMuxer.receivedTracks == nil)
+    }
+
+    @Test("Original-only language arrays retain the CEA-608 compatibility path")
+    func givenNoTranslatedTextWhenExportingTracksThenUnicodeMuxerIsSkipped() async throws {
+        let captionedURL = URL(fileURLWithPath: "/tmp/captioned.mov")
+        let original = try #require(try sampleLanguageTracks().first)
+        let unicodeMuxer = StubUnicodeCaptionMuxer(result: .failure(.unexpectedCaptionMux))
+        let pipeline = makePipeline(
+            embedder: StubCaptionMuxer(result: .success(captionedURL)),
+            unicodeEmbedder: unicodeMuxer
+        )
+
+        let result = try await pipeline.exportCaptions(
+            tracks: [original],
+            videoURL: URL(fileURLWithPath: "/tmp/source.mov"),
+            format: .embeddedMovCaptions
+        )
+
+        #expect(result.videoURL == captionedURL)
+        #expect(unicodeMuxer.receivedTracks == nil)
+    }
+
+    @Test("Multilingual exports require the Original cue timeline")
+    func givenTranslationTimingMismatchWhenExportingThenValidationFails() async throws {
+        let original = try #require(try sampleLanguageTracks().first)
+        let translation = try CaptionLanguageTrack(
+            languageIdentifier: "es-ES",
+            segments: [CaptionSegment(index: 1, startTime: 0.1, endTime: 1, text: "Hola")]
+        )
+        let pipeline = makePipeline(
+            embedder: StubCaptionMuxer(result: .failure(.unexpectedCaptionMux)),
+            unicodeEmbedder: StubUnicodeCaptionMuxer(result: .failure(.unexpectedCaptionMux))
+        )
+
+        await #expect(throws: CaptionLanguageTrackError.mismatchedTimeline("es-ES")) {
+            try await pipeline.exportCaptions(
+                tracks: [original, translation],
+                videoURL: URL(fileURLWithPath: "/tmp/source.mov"),
+                format: .embeddedMovCaptions
+            )
+        }
+    }
+
     private var sampleSegments: [CaptionSegment] {
         [CaptionSegment(index: 1, startTime: 0, endTime: 1, text: "Hello")]
     }
 
+    private func sampleLanguageTracks() throws -> [CaptionLanguageTrack] {
+        [
+            try CaptionLanguageTrack(languageIdentifier: "en-US", segments: sampleSegments),
+            try CaptionLanguageTrack(
+                languageIdentifier: "es-ES",
+                segments: [CaptionSegment(index: 1, startTime: 0, endTime: 1, text: "Hola")]
+            ),
+        ]
+    }
+
     private func makePipeline(
         embedder: any CaptionEmbeddingMuxing,
+        unicodeEmbedder: (any UnicodeCaptionEmbeddingMuxing)? = nil,
         embeddingTimeoutMargin: TimeInterval = 2,
         discardedCaptionOutputCleanup: @escaping @Sendable (URL) -> Void = { url in
             try? FileManager.default.removeItem(at: url)
@@ -255,10 +369,40 @@ struct CaptionPipelineExportTests {
     ) -> CaptionPipeline {
         CaptionPipeline(
             embedder: embedder,
+            unicodeEmbedder: unicodeEmbedder,
             embeddingTimeoutMargin: embeddingTimeoutMargin,
             embeddingCleanupScheduler: CaptionEmbeddingTimeout.CleanupScheduler(),
             discardedCaptionOutputCleanup: discardedCaptionOutputCleanup
         )
+    }
+}
+
+private final class StubUnicodeCaptionMuxer: UnicodeCaptionEmbeddingMuxing, Sendable {
+    private let result: Result<URL, CaptionPipelineExportTestError>
+    private let tracks = Mutex<[CaptionLanguageTrack]?>(nil)
+
+    var receivedTracks: [CaptionLanguageTrack]? {
+        tracks.withLock { $0 }
+    }
+
+    init(result: Result<URL, CaptionPipelineExportTestError>) {
+        self.result = result
+    }
+
+    @concurrent func estimatedEmbeddingTimeout(
+        for _: [CaptionLanguageTrack],
+        into _: URL
+    ) async throws -> TimeInterval {
+        10
+    }
+
+    @concurrent func embedUnicodeCaptions(
+        from tracks: [CaptionLanguageTrack],
+        into _: URL,
+        progressHandler _: (@Sendable (Float) -> Void)?
+    ) async throws -> URL {
+        self.tracks.withLock { $0 = tracks }
+        return try result.get()
     }
 }
 

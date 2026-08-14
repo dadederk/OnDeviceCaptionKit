@@ -19,8 +19,8 @@ struct LegacySpeechProvider: CaptionRecognitionProvider {
 
     private let speechAuthorizationProvider: any SpeechAuthorizationProviding
     private let requestFactory: any LegacySpeechURLRecognitionRequestMaking
-    private let minimumSegmentDuration: TimeInterval = 1.0
-    private let maximumSegmentDuration: TimeInterval = 8.0
+    private let maximumSegmentDuration: TimeInterval = 5.0
+    private let maximumSegmentCharacters = 64
 
     init(
         speechAuthorizationProvider: any SpeechAuthorizationProviding = SystemSpeechAuthorizationProvider(),
@@ -121,6 +121,16 @@ struct LegacySpeechProvider: CaptionRecognitionProvider {
 
         try Task.checkCancellation()
         CaptionTranscriptionProgress.reportFinalizing(progressHandler)
+        if let first = result.segments.first, let last = result.segments.last {
+            let recognizedStart = String(format: "%.2f", first.startTime)
+            let recognizedEnd = String(format: "%.2f", last.endTime)
+            CaptionLogger.info(
+                "Legacy recognition finalized with \(result.segments.count) timed token(s), "
+                    + "recognized range \(recognizedStart)s–\(recognizedEnd)s"
+            )
+        } else {
+            CaptionLogger.info("Legacy recognition finalized without timed tokens")
+        }
         let segments = try await processRecognitionResult(result, duration: durationSeconds)
         try Task.checkCancellation()
         CaptionTranscriptionProgress.reportComplete(progressHandler)
@@ -138,45 +148,86 @@ struct LegacySpeechProvider: CaptionRecognitionProvider {
 
         var segments: [CaptionSegment] = []
         var segmentIndex = 1
-        var currentSegmentStart: TimeInterval = 0
+        var currentSegmentStart: TimeInterval?
         var currentSegmentText = ""
 
         for (index, segment) in allSegments.enumerated() {
             try Task.checkCancellation()
             let isSentenceBoundary = sentenceBoundaries.contains(index)
-            let hasPause = index > 0 ? hasSignificantPause(before: segment, after: allSegments[index - 1]) : false
+            let hasPause = index > 0 ? hasSignificantPause(
+                before: allSegments[index - 1],
+                after: segment
+            ) : false
+            let candidateText = currentSegmentText
+                + (currentSegmentText.isEmpty ? "" : " ")
+                + segment.substring
+            let exceedsReadableLength = !currentSegmentText.isEmpty
+                && candidateText.count > maximumSegmentCharacters
+            if hasPause || exceedsReadableLength {
+                appendCaption(
+                    to: &segments,
+                    index: &segmentIndex,
+                    startTime: currentSegmentStart,
+                    endTime: allSegments[index - 1].endTime,
+                    text: &currentSegmentText
+                )
+                currentSegmentStart = nil
+            }
+            if currentSegmentStart == nil {
+                currentSegmentStart = segment.startTime
+            }
             currentSegmentText += (currentSegmentText.isEmpty ? "" : " ") + segment.substring
 
-            let shouldEndSegment = isSentenceBoundary || hasPause ||
-                (segment.endTime - currentSegmentStart) > maximumSegmentDuration
+            let segmentDuration = segment.endTime - (currentSegmentStart ?? segment.startTime)
+            let shouldEndSegment = isSentenceBoundary || segmentDuration >= maximumSegmentDuration
 
             if shouldEndSegment && !currentSegmentText.isEmpty {
-                segments.append(
-                    CaptionSegment(
-                        index: segmentIndex,
-                        startTime: currentSegmentStart,
-                        endTime: segment.endTime,
-                        text: formatSubtitleText(currentSegmentText.trimmingCharacters(in: .whitespacesAndNewlines))
-                    )
+                appendCaption(
+                    to: &segments,
+                    index: &segmentIndex,
+                    startTime: currentSegmentStart,
+                    endTime: segment.endTime,
+                    text: &currentSegmentText
                 )
-                segmentIndex += 1
-                currentSegmentStart = segment.endTime
-                currentSegmentText = ""
+                currentSegmentStart = nil
             }
         }
 
         if !currentSegmentText.isEmpty {
-            segments.append(
-                CaptionSegment(
-                    index: segmentIndex,
-                    startTime: currentSegmentStart,
-                    endTime: duration,
-                    text: formatSubtitleText(currentSegmentText.trimmingCharacters(in: .whitespacesAndNewlines))
-                )
+            appendCaption(
+                to: &segments,
+                index: &segmentIndex,
+                startTime: currentSegmentStart,
+                endTime: min(duration, allSegments.last?.endTime ?? duration),
+                text: &currentSegmentText
             )
         }
 
-        return segments.filter { !$0.text.isEmpty && $0.duration >= minimumSegmentDuration }
+        return segments
+    }
+
+    private func appendCaption(
+        to captions: inout [CaptionSegment],
+        index: inout Int,
+        startTime: TimeInterval?,
+        endTime: TimeInterval,
+        text: inout String
+    ) {
+        let formattedText = formatSubtitleText(text.trimmingCharacters(in: .whitespacesAndNewlines))
+        guard let startTime, !formattedText.isEmpty, endTime > startTime else {
+            text = ""
+            return
+        }
+        captions.append(
+            CaptionSegment(
+                index: index,
+                startTime: startTime,
+                endTime: endTime,
+                text: formattedText
+            )
+        )
+        index += 1
+        text = ""
     }
 
     private func identifySentenceBoundaries(
