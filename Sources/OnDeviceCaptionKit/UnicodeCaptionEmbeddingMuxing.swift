@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 
 @available(macOS 26, *)
@@ -18,10 +19,23 @@ protocol UnicodeCaptionEmbeddingMuxing: Sendable {
 extension UnicodeCaptionEmbedder: UnicodeCaptionEmbeddingMuxing {
     @concurrent
     func estimatedEmbeddingTimeout(
-        for _: [CaptionLanguageTrack],
-        into _: URL
+        for tracks: [CaptionLanguageTrack],
+        into videoURL: URL
     ) async throws -> TimeInterval {
-        10
+        let asset = AVURLAsset(url: videoURL)
+        let duration = (try? await asset.load(.duration).seconds) ?? 0
+        let fileSize = (try? videoURL.resourceValues(forKeys: [.fileSizeKey]).fileSize)
+            .map(Int64.init) ?? 0
+        let budget = CaptionEmbeddingTimeoutBudget.unicodeEmbeddingTimeout(
+            duration: duration,
+            fileSizeBytes: fileSize
+        )
+        CaptionLogger.info(
+            "Estimated Unicode embedding budget: tracks=\(tracks.count), "
+                + "duration=\(Self.formatted(duration))s, sourceBytes=\(fileSize), "
+                + "budget=\(Self.formatted(budget))s"
+        )
+        return budget
     }
 
     @concurrent
@@ -35,5 +49,9 @@ extension UnicodeCaptionEmbedder: UnicodeCaptionEmbeddingMuxing {
             into: videoURL,
             progressHandler: progressHandler
         )
+    }
+
+    private static func formatted(_ value: TimeInterval) -> String {
+        String(format: "%.1f", value.isFinite ? value : 0)
     }
 }

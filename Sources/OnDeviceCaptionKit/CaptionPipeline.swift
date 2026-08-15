@@ -245,10 +245,20 @@ public struct CaptionPipeline: Sendable {
         switch format {
         case .embeddedMovCaptions:
             do {
-                let timeoutBudget = try await unicodeEmbedder.estimatedEmbeddingTimeout(
+                let estimatedTimeout = try await unicodeEmbedder.estimatedEmbeddingTimeout(
                     for: nonemptyTracks,
                     into: videoURL
-                ) + embeddingTimeoutMargin
+                )
+                let timeoutBudget = estimatedTimeout + embeddingTimeoutMargin
+                let cueCount = nonemptyTracks.reduce(into: 0) { count, track in
+                    count += track.segments.lazy.filter {
+                        !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    }.count
+                }
+                CaptionLogger.info(
+                    "Starting Unicode caption embedding: tracks=\(nonemptyTracks.count), "
+                        + "cues=\(cueCount), timeout=\(Self.formatted(timeoutBudget))s"
+                )
                 let captionedURL = try await CaptionEmbeddingTimeout.run(
                     seconds: timeoutBudget,
                     cleanupScheduler: embeddingCleanupScheduler,
@@ -345,5 +355,9 @@ public struct CaptionPipeline: Sendable {
         #if DEBUG
         CaptionLogger.debugTranscript("Transcribed \(segments.count) segment(s)", enabled: configuration.transcription.debugLogTranscripts)
         #endif
+    }
+
+    private static func formatted(_ value: TimeInterval) -> String {
+        String(format: "%.1f", value.isFinite ? value : 0)
     }
 }

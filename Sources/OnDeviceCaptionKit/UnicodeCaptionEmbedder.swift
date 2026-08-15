@@ -25,13 +25,29 @@ struct UnicodeCaptionEmbedder: Sendable {
         }
 
         let outputURL = Self.temporaryURL(prefix: "CaptionedRecording")
+        let captionTrackURL = Self.temporaryURL(prefix: "CaptionTracks")
+        defer { try? FileManager.default.removeItem(at: captionTrackURL) }
+        let startedAt = ContinuousClock.now
         do {
             progressHandler?(0)
             try await Tx3gCaptionTrackWriter().write(
                 tracks: nonemptyTracks,
-                to: outputURL,
-                terminalPadding: 0.001,
-                copyingMediaFrom: videoURL
+                to: captionTrackURL,
+                terminalPadding: 0.001
+            )
+            try Task.checkCancellation()
+            CaptionLogger.info(
+                "Unicode caption staging completed; beginning passthrough media mux"
+            )
+            try await PassthroughCaptionTrackMuxer().mux(
+                captionsFrom: captionTrackURL,
+                withMediaFrom: videoURL,
+                to: outputURL
+            )
+            CaptionLogger.info(
+                "Unicode media copy completed: tracks=\(nonemptyTracks.count), "
+                    + "outputBytes=\(Self.fileSize(at: outputURL)), "
+                    + "elapsed=\(Self.elapsedSeconds(since: startedAt))s"
             )
             try Task.checkCancellation()
             progressHandler?(1)
@@ -45,7 +61,8 @@ struct UnicodeCaptionEmbedder: Sendable {
                 )
             }
             CaptionLogger.info(
-                "Embedded and validated \(decodedTracks.count) Unicode caption track(s)"
+                "Embedded and validated \(decodedTracks.count) Unicode caption track(s), "
+                    + "elapsed=\(Self.elapsedSeconds(since: startedAt))s"
             )
             return outputURL
         } catch {
@@ -77,5 +94,17 @@ struct UnicodeCaptionEmbedder: Sendable {
         FileManager.default.temporaryDirectory
             .appendingPathComponent("\(prefix)-\(UUID().uuidString)")
             .appendingPathExtension("mov")
+    }
+
+    private static func fileSize(at url: URL) -> Int64 {
+        (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize)
+            .map(Int64.init) ?? 0
+    }
+
+    private static func elapsedSeconds(since start: ContinuousClock.Instant) -> String {
+        let components = start.duration(to: .now).components
+        let seconds = Double(components.seconds)
+            + Double(components.attoseconds) / 1_000_000_000_000_000_000
+        return String(format: "%.3f", seconds)
     }
 }

@@ -31,6 +31,26 @@ struct CaptionEmbedderTests {
         #expect(budget == 42)
     }
 
+    @Test(
+        "Unicode embedding timeout scales with source workload",
+        arguments: [
+            UnicodeTimeoutCase(duration: 0, fileSizeBytes: 0, expected: 30),
+            UnicodeTimeoutCase(duration: 26, fileSizeBytes: 35 * 1_024 * 1_024, expected: 67),
+            UnicodeTimeoutCase(duration: 600, fileSizeBytes: 800 * 1_024 * 1_024, expected: 600),
+            UnicodeTimeoutCase(duration: 10_000, fileSizeBytes: 0, expected: 600),
+        ]
+    )
+    func givenSourceWorkloadWhenComputingUnicodeBudgetThenBoundsCopyTime(
+        scenario: UnicodeTimeoutCase
+    ) {
+        let budget = CaptionEmbeddingTimeoutBudget.unicodeEmbeddingTimeout(
+            duration: scenario.duration,
+            fileSizeBytes: scenario.fileSizeBytes
+        )
+
+        #expect(budget == scenario.expected)
+    }
+
     @Test("Each caption embedding step keeps its short timeout", .timeLimit(.minutes(1)))
     func givenStalledEmbeddingStepWhenTimeoutExpiresThenStepCancelsIndependently() async {
         let cleanupScheduler = CaptionEmbeddingTimeout.CleanupScheduler()
@@ -388,6 +408,60 @@ struct CaptionEmbedderTests {
     }
 
     @Test(
+        "Production-length multilingual movie completes within workload timeout",
+        .timeLimit(.minutes(2))
+    )
+    func givenProductionSampleVolumeWhenEmbeddingTwoLanguagesThenMOVIsReturned() async throws {
+        let oneSecondURL = try await makeTinyMOV(includeAudio: true)
+        defer { try? FileManager.default.removeItem(at: oneSecondURL) }
+        let sourceURL = try await repeatMOV(at: oneSecondURL, count: 26)
+        defer { try? FileManager.default.removeItem(at: sourceURL) }
+        let cueTimes: [(TimeInterval, TimeInterval)] = [
+            (2.520, 6.000),
+            (6.000, 10.680),
+            (11.760, 13.860),
+            (15.120, 18.840),
+            (19.320, 22.000),
+            (22.000, 25.200),
+        ]
+        let originalSegments = cueTimes.enumerated().map { index, time in
+            CaptionSegment(
+                index: index + 1,
+                startTime: time.0,
+                endTime: time.1,
+                text: "Original \(index + 1)"
+            )
+        }
+        let translatedSegments = cueTimes.enumerated().map { index, time in
+            CaptionSegment(
+                index: index + 1,
+                startTime: time.0,
+                endTime: time.1,
+                text: "Traducción \(index + 1)"
+            )
+        }
+        let tracks = [
+            try CaptionLanguageTrack(languageIdentifier: "en-US", segments: originalSegments),
+            try CaptionLanguageTrack(languageIdentifier: "es", segments: translatedSegments),
+        ]
+
+        let result = try await CaptionPipeline().exportCaptions(
+            tracks: tracks,
+            videoURL: sourceURL,
+            format: .embeddedMovCaptions
+        )
+        defer {
+            if result.videoURL != sourceURL {
+                try? FileManager.default.removeItem(at: result.videoURL)
+            }
+        }
+
+        #expect(result.deferredSRTTracks == nil)
+        #expect(result.warningCode == nil)
+        #expect(try await Tx3gCaptionTrackReader().read(from: result.videoURL) == tracks)
+    }
+
+    @Test(
         "Caption muxer embeds captions into an export-session muxed MOV without deadlocking",
         .timeLimit(.minutes(1))
     )
@@ -500,6 +574,52 @@ struct CaptionEmbedderTests {
         }
 
         guard let exportSession = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetPassthrough) else {
+            throw CaptionEmbeddingTestError.writerFailed
+        }
+        try await exportSession.export(to: outputURL, as: .mov)
+        return outputURL
+    }
+
+    private func repeatMOV(at sourceURL: URL, count: Int) async throws -> URL {
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CaptionEmbedderTests-repeated-\(UUID().uuidString)")
+            .appendingPathExtension("mov")
+        try? FileManager.default.removeItem(at: outputURL)
+
+        let asset = AVURLAsset(url: sourceURL)
+        let composition = AVMutableComposition()
+        let videoTrack = try await asset.loadTracks(withMediaType: .video).first
+        guard let videoTrack,
+              let compositionVideo = composition.addMutableTrack(
+                  withMediaType: .video,
+                  preferredTrackID: kCMPersistentTrackID_Invalid
+              ) else {
+            throw CaptionEmbeddingTestError.cannotAddVideoInput
+        }
+        let sourceRange = try await videoTrack.load(.timeRange)
+        let audioTrack = try await asset.loadTracks(withMediaType: .audio).first
+        let compositionAudio = audioTrack.flatMap { _ in
+            composition.addMutableTrack(
+                withMediaType: .audio,
+                preferredTrackID: kCMPersistentTrackID_Invalid
+            )
+        }
+        for repetition in 0..<max(count, 0) {
+            let insertionTime = CMTimeMultiply(
+                sourceRange.duration,
+                multiplier: Int32(repetition)
+            )
+            try compositionVideo.insertTimeRange(sourceRange, of: videoTrack, at: insertionTime)
+            if let audioTrack, let compositionAudio {
+                let audioRange = try await audioTrack.load(.timeRange)
+                try compositionAudio.insertTimeRange(audioRange, of: audioTrack, at: insertionTime)
+            }
+        }
+
+        guard let exportSession = AVAssetExportSession(
+            asset: composition,
+            presetName: AVAssetExportPresetPassthrough
+        ) else {
             throw CaptionEmbeddingTestError.writerFailed
         }
         try await exportSession.export(to: outputURL, as: .mov)
@@ -987,6 +1107,16 @@ struct CaptionEmbedderTests {
             merged[merged.count - 1] = AVCaption(caption.text, timeRange: mergedRange)
         }
         return merged
+    }
+}
+
+struct UnicodeTimeoutCase: Sendable, CustomTestStringConvertible {
+    let duration: TimeInterval
+    let fileSizeBytes: Int64
+    let expected: TimeInterval
+
+    var testDescription: String {
+        "duration=\(duration), bytes=\(fileSizeBytes), expected=\(expected)"
     }
 }
 

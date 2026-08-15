@@ -9,10 +9,6 @@ enum Tx3gCaptionError: Error, Equatable {
     case textSampleTooLarge
     case cannotAddInput
     case cannotAddInputGroup
-    case missingSourceFormatDescription
-    case cannotAddSourceOutput
-    case cannotStartReader
-    case readerFailed
     case cannotStartWriter
     case writerFailed
 }
@@ -35,26 +31,17 @@ struct Tx3gCaptionTrackWriter: Sendable {
         let receiver: AVAssetWriterInput.SampleBufferReceiver
         let formatDescription: CMFormatDescription
         let samples: [Sample]
-        var nextIndex = 0
-    }
-
-    private struct PreparedSourceTrack {
-        let input: AVAssetWriterInput
-        let output: AVAssetReaderTrackOutput
-    }
-
-    private struct SourceTrackWriterState {
-        let receiver: AVAssetWriterInput.SampleBufferReceiver
-        let provider: AVAssetReaderOutput.Provider<CMReadySampleBuffer<CMSampleBuffer.DynamicContent>>
+        var nextSampleIndex = 0
+        var pendingSample: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>?
         var isFinished = false
+        var appendedSampleCount = 0
     }
 
     @concurrent
     func write(
         tracks: [CaptionLanguageTrack],
         to outputURL: URL,
-        terminalPadding: TimeInterval = 0,
-        copyingMediaFrom sourceURL: URL? = nil
+        terminalPadding: TimeInterval = 0
     ) async throws {
         let preparedTracks = try tracks.compactMap {
             try Self.prepareTrack($0, terminalPadding: terminalPadding)
@@ -63,19 +50,6 @@ struct Tx3gCaptionTrackWriter: Sendable {
 
         try? FileManager.default.removeItem(at: outputURL)
         let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
-        let sourceReader: AVAssetReader?
-        let preparedSourceTracks: [PreparedSourceTrack]
-        if let sourceURL {
-            let preparedSource = try await Self.prepareSourceTracks(
-                from: sourceURL,
-                writer: writer
-            )
-            sourceReader = preparedSource.reader
-            preparedSourceTracks = preparedSource.tracks
-        } else {
-            sourceReader = nil
-            preparedSourceTracks = []
-        }
         for preparedTrack in preparedTracks {
             guard writer.canAdd(preparedTrack.input) else { throw Tx3gCaptionError.cannotAddInput }
             writer.add(preparedTrack.input)
@@ -96,55 +70,17 @@ struct Tx3gCaptionTrackWriter: Sendable {
                 samples: $0.samples
             )
         }
-        var sourceTrackStates: [SourceTrackWriterState] = []
-        if let sourceReader {
-            sourceTrackStates = preparedSourceTracks.map {
-                SourceTrackWriterState(
-                    receiver: writer.inputReceiver(for: $0.input),
-                    provider: sourceReader.outputProvider(for: $0.output)
-                )
-            }
-        }
-
         guard writer.startWriting() else {
             throw writer.error ?? Tx3gCaptionError.cannotStartWriter
         }
         writer.startSession(atSourceTime: .zero)
-        if let sourceReader, !sourceReader.startReading() {
-            writer.cancelWriting()
-            throw sourceReader.error ?? Tx3gCaptionError.cannotStartReader
-        }
 
-        while trackStates.contains(where: { $0.nextIndex < $0.samples.count })
-            || sourceTrackStates.contains(where: { !$0.isFinished }) {
-            for index in sourceTrackStates.indices where !sourceTrackStates[index].isFinished {
-                try Task.checkCancellation()
-                if let sourceSample = try await sourceTrackStates[index].provider.next() {
-                    try await sourceTrackStates[index].receiver.append(sourceSample)
-                } else {
-                    sourceTrackStates[index].receiver.finish()
-                    sourceTrackStates[index].isFinished = true
-                }
-            }
-            for index in trackStates.indices where trackStates[index].nextIndex < trackStates[index].samples.count {
-                try Task.checkCancellation()
-                let sample = trackStates[index].samples[trackStates[index].nextIndex]
-                trackStates[index].nextIndex += 1
-                let readySample = try Self.makeSampleBuffer(
-                    text: sample.text,
-                    startTime: sample.startTime,
-                    endTime: sample.endTime,
-                    formatDescription: trackStates[index].formatDescription
-                )
-                try await trackStates[index].receiver.append(readySample)
-            }
-        }
-        for trackState in trackStates {
-            trackState.receiver.finish()
-        }
-        if let sourceReader, sourceReader.status != .completed {
+        do {
+            try await Self.appendCaptionTracks(&trackStates)
+        } catch {
+            CaptionLogger.error("tx3g writer append failed: \(String(reflecting: error))")
             writer.cancelWriting()
-            throw sourceReader.error ?? Tx3gCaptionError.readerFailed
+            throw error
         }
 
         await writer.finishWriting()
@@ -154,45 +90,67 @@ struct Tx3gCaptionTrackWriter: Sendable {
             )
             throw writer.error ?? Tx3gCaptionError.writerFailed
         }
+        CaptionLogger.info(
+            "tx3g writer completed: captionTracks=\(trackStates.count), "
+                + "captionSamples=\(trackStates.reduce(0) { $0 + $1.appendedSampleCount })"
+        )
     }
 
-    private static func prepareSourceTracks(
-        from sourceURL: URL,
-        writer: AVAssetWriter
-    ) async throws -> (reader: AVAssetReader, tracks: [PreparedSourceTrack]) {
-        let asset = AVURLAsset(url: sourceURL)
-        let reader = try AVAssetReader(asset: asset)
-        let videoTracks = try await asset.loadTracks(withMediaType: .video)
-        let audioTracks = try await asset.loadTracks(withMediaType: .audio)
-        var preparedTracks: [PreparedSourceTrack] = []
+    private static func appendCaptionTracks(
+        _ states: inout [TrackWriterState]
+    ) async throws {
+        let clock = ContinuousClock()
+        var nextStallReport = clock.now + .seconds(2)
+        while states.contains(where: { !$0.isFinished }) {
+            try Task.checkCancellation()
+            try stageCaptionSamples(in: &states)
 
-        for (mediaType, tracks) in [(AVMediaType.video, videoTracks), (.audio, audioTracks)] {
-            for track in tracks {
-                let formatDescriptions = try await track.load(.formatDescriptions)
-                guard let formatDescription = formatDescriptions.first else {
-                    throw Tx3gCaptionError.missingSourceFormatDescription
+            var madeProgress = false
+            for index in states.indices {
+                guard let sample = states[index].pendingSample else { continue }
+                if try states[index].receiver.appendImmediately(sample) {
+                    states[index].pendingSample = nil
+                    states[index].nextSampleIndex += 1
+                    states[index].appendedSampleCount += 1
+                    madeProgress = true
                 }
-                let input = AVAssetWriterInput(
-                    mediaType: mediaType,
-                    outputSettings: nil,
-                    sourceFormatHint: formatDescription
-                )
-                input.expectsMediaDataInRealTime = false
-                input.languageCode = try await track.load(.languageCode)
-                input.extendedLanguageTag = try await track.load(.extendedLanguageTag)
-                if mediaType == .video {
-                    input.mediaTimeScale = try await track.load(.naturalTimeScale)
-                    input.transform = try await track.load(.preferredTransform)
-                }
-                guard writer.canAdd(input) else { throw Tx3gCaptionError.cannotAddInput }
-                writer.add(input)
+            }
 
-                let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
-                guard reader.canAdd(output) else { throw Tx3gCaptionError.cannotAddSourceOutput }
-                preparedTracks.append(PreparedSourceTrack(input: input, output: output))
+            if madeProgress {
+                nextStallReport = clock.now + .seconds(2)
+            } else {
+                if clock.now >= nextStallReport {
+                    CaptionLogger.warning(
+                        "tx3g writer waiting for input readiness: "
+                            + "captionSamples=\(captionSampleCounts(in: states))"
+                    )
+                    nextStallReport = clock.now + .seconds(10)
+                }
+                try await Task.sleep(for: .milliseconds(1))
             }
         }
-        return (reader, preparedTracks)
+    }
+
+    private static func stageCaptionSamples(in states: inout [TrackWriterState]) throws {
+        for index in states.indices where !states[index].isFinished {
+            guard states[index].pendingSample == nil else { continue }
+            guard states[index].nextSampleIndex < states[index].samples.count else {
+                states[index].receiver.finish()
+                states[index].isFinished = true
+                continue
+            }
+            let sample = states[index].samples[states[index].nextSampleIndex]
+            states[index].pendingSample = try makeSampleBuffer(
+                text: sample.text,
+                startTime: sample.startTime,
+                endTime: sample.endTime,
+                formatDescription: states[index].formatDescription
+            )
+        }
+    }
+
+    private static func captionSampleCounts(in states: [TrackWriterState]) -> String {
+        states.map { String($0.appendedSampleCount) }.joined(separator: ",")
     }
 
     private static func prepareTrack(
@@ -212,6 +170,7 @@ struct Tx3gCaptionTrackWriter: Sendable {
         )
         input.expectsMediaDataInRealTime = false
         input.mediaTimeScale = 1_000
+        input.mediaDataLocation = .sparselyInterleavedWithMainMediaData
         input.extendedLanguageTag = track.languageIdentifier
         input.languageCode = iso639_2TCode(for: track.languageIdentifier)
 
@@ -220,11 +179,7 @@ struct Tx3gCaptionTrackWriter: Sendable {
         for segment in segments {
             if segment.startTime > previousEnd {
                 samples.append(
-                    Sample(
-                        text: "",
-                        startTime: previousEnd,
-                        endTime: segment.startTime
-                    )
+                    Sample(text: "", startTime: previousEnd, endTime: segment.startTime)
                 )
             }
             samples.append(

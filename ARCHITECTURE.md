@@ -88,7 +88,10 @@ CaptionLanguageTrack array
        Unicode text tracks
            |
            v
-       Grouped writer with direct compressed video/audio sample forwarding
+       Passthrough composition with source video/audio
+           |
+           v
+       Caption alternate-group header repair
            |
            v
        Tx3gCaptionTrackReader validation

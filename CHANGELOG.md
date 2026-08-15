@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-08-15
+
+### Changed
+- Unicode MOV export now authors caption-only `tx3g` tracks before combining them with source video and audio through an AVFoundation passthrough composition.
+- Unicode embedding timeouts now scale with source duration and file size within bounded limits, with phase, workload, and elapsed-time diagnostics that do not log caption text or filenames.
+
+### Fixed
+- Prevented production recordings with sparse or discontinuity media samples from stalling the grouped writer and falling back to multilingual SRT after a fixed timeout.
+- Restored a shared alternate caption group after passthrough export so every language remains selectable while compressed video and audio payloads stay byte-identical.
+
+## [0.3.1] - 2026-08-14
+
+### Fixed
+- Replaced a timing-sensitive cleanup admission assertion with deterministic synchronization so the supported Xcode CI matrix remains stable.
+
 ## [0.3.0] - 2026-08-14
 
 ### Added
