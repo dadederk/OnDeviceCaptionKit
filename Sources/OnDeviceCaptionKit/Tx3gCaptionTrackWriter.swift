@@ -252,7 +252,7 @@ struct Tx3gCaptionTrackWriter: Sendable {
             kCMTextFormatDescriptionExtension_BackgroundColor: transparent,
             kCMTextFormatDescriptionExtension_DefaultTextBox: textBox,
             kCMTextFormatDescriptionExtension_DefaultStyle: style,
-            kCMTextFormatDescriptionExtension_FontTable: ["1": "Serif"],
+            kCMTextFormatDescriptionExtension_FontTable: ["1": "Sans-Serif"],
         ]
 
         var formatDescription: CMFormatDescription?

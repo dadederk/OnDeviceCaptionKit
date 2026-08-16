@@ -43,6 +43,20 @@ struct Tx3gCaptionTrackWriterTests {
         #expect(playable.allSatisfy { $0 })
         let sizes = try await tracks.asyncMap { try await $0.load(.naturalSize) }
         #expect(sizes.allSatisfy { $0 == presentationSize })
+        let formatDescriptions = try await tracks.asyncMap {
+            try await $0.load(.formatDescriptions)
+        }
+        for descriptions in formatDescriptions {
+            let description = try #require(descriptions.first)
+            let formatExtensions = try #require(
+                CMFormatDescriptionGetExtensions(description)
+            )
+            let extensions = formatExtensions as NSDictionary
+            let fontTable = try #require(
+                extensions[kCMTextFormatDescriptionExtension_FontTable] as? [String: String]
+            )
+            #expect(fontTable["1"] == "Sans-Serif")
+        }
 
         let decodedTracks = try await Tx3gCaptionTrackReader().read(from: outputURL)
         let decodedByTag = Dictionary(
