@@ -405,6 +405,21 @@ struct CaptionEmbedderTests {
             selectionGroup?.options.compactMap { $0.locale?.identifier } ?? []
         )
         #expect(selectableLanguages.isSuperset(of: ["en-US", "ar-SA"]))
+        let authoredOptions = selectionGroup?.options.filter {
+            ["en-US", "ar-SA"].contains($0.locale?.identifier)
+        } ?? []
+        #expect(!authoredOptions.isEmpty)
+        #expect(authoredOptions.allSatisfy { $0.isPlayable })
+        let subtitleTracks = try await AVURLAsset(url: outputURL).loadTracks(
+            withMediaType: .subtitle
+        )
+        #expect(subtitleTracks.count == 2)
+        for track in subtitleTracks {
+            #expect(try await track.load(.isPlayable))
+            let size = try await track.load(.naturalSize)
+            #expect(size.width > 0)
+            #expect(size.height > 0)
+        }
     }
 
     @Test(

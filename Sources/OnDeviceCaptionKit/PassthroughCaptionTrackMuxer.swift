@@ -35,9 +35,9 @@ struct PassthroughCaptionTrackMuxer: Sendable {
             }
         }
 
-        let captionTracks = try await captionAsset.loadTracks(withMediaType: .text)
+        let captionTracks = try await captionAsset.loadTracks(withMediaType: .subtitle)
         for track in captionTracks {
-            let destination = try Self.addTrack(of: .text, to: composition)
+            let destination = try Self.addTrack(of: .subtitle, to: composition)
             let timeRange = try await track.load(.timeRange)
             try destination.insertTimeRange(timeRange, of: track, at: .zero)
             destination.languageCode = try await track.load(.languageCode)
@@ -71,7 +71,7 @@ struct PassthroughCaptionTrackMuxer: Sendable {
 
     private static func setCaptionAlternateGroup(in outputURL: URL) async throws {
         let movie = AVMutableMovie(url: outputURL, options: nil)
-        let captionTracks = try await movie.loadTracks(withMediaType: .text)
+        let captionTracks = try await movie.loadTracks(withMediaType: .subtitle)
         for (index, track) in captionTracks.enumerated() {
             track.alternateGroupID = 1
             track.isEnabled = index == 0

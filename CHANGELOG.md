@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-08-16
+
+### Changed
+- Package OSLog output now uses the host bundle identifier and the `subtitles` category so consuming-app caption logs share one correctly capitalized subsystem and category.
+- TX3G diagnostics now use consistent capitalization and distinguish payload decoding from playback validation.
+
+### Fixed
+- Authored Unicode TX3G under the modern subtitle handler instead of the legacy text handler, making embedded languages playable in QuickTime and AVPlayer.
+- Applied the source video's presentation dimensions to each subtitle track and its default text region.
+- Added playback, handler, decoded-cue, language, and media-sample fixture coverage so a metadata-only but unplayable caption track can no longer pass package validation.
+
 ## [0.3.2] - 2026-08-15
 
 ### Changed

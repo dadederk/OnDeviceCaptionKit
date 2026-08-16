@@ -5,6 +5,7 @@ import Foundation
 @available(macOS 26, *)
 enum Tx3gCaptionError: Error, Equatable {
     case noCaptionTracks
+    case invalidPresentationSize
     case cannotCreateFormatDescription(OSStatus)
     case textSampleTooLarge
     case cannotAddInput
@@ -41,10 +42,16 @@ struct Tx3gCaptionTrackWriter: Sendable {
     func write(
         tracks: [CaptionLanguageTrack],
         to outputURL: URL,
+        presentationSize: CGSize,
         terminalPadding: TimeInterval = 0
     ) async throws {
+        let presentationSize = try Self.validated(presentationSize: presentationSize)
         let preparedTracks = try tracks.compactMap {
-            try Self.prepareTrack($0, terminalPadding: terminalPadding)
+            try Self.prepareTrack(
+                $0,
+                presentationSize: presentationSize,
+                terminalPadding: terminalPadding
+            )
         }
         guard !preparedTracks.isEmpty else { throw Tx3gCaptionError.noCaptionTracks }
 
@@ -78,7 +85,7 @@ struct Tx3gCaptionTrackWriter: Sendable {
         do {
             try await Self.appendCaptionTracks(&trackStates)
         } catch {
-            CaptionLogger.error("tx3g writer append failed: \(String(reflecting: error))")
+            CaptionLogger.error("TX3G writer append failed: \(String(reflecting: error))")
             writer.cancelWriting()
             throw error
         }
@@ -86,12 +93,12 @@ struct Tx3gCaptionTrackWriter: Sendable {
         await writer.finishWriting()
         guard writer.status == .completed else {
             CaptionLogger.error(
-                "tx3g writer failed: \(writer.error?.localizedDescription ?? "unknown writer failure")"
+                "TX3G writer failed: \(writer.error?.localizedDescription ?? "unknown writer failure")"
             )
             throw writer.error ?? Tx3gCaptionError.writerFailed
         }
         CaptionLogger.info(
-            "tx3g writer completed: captionTracks=\(trackStates.count), "
+            "TX3G writer completed: captionTracks=\(trackStates.count), "
                 + "captionSamples=\(trackStates.reduce(0) { $0 + $1.appendedSampleCount })"
         )
     }
@@ -121,7 +128,7 @@ struct Tx3gCaptionTrackWriter: Sendable {
             } else {
                 if clock.now >= nextStallReport {
                     CaptionLogger.warning(
-                        "tx3g writer waiting for input readiness: "
+                        "TX3G writer waiting for input readiness: "
                             + "captionSamples=\(captionSampleCounts(in: states))"
                     )
                     nextStallReport = clock.now + .seconds(10)
@@ -155,6 +162,7 @@ struct Tx3gCaptionTrackWriter: Sendable {
 
     private static func prepareTrack(
         _ track: CaptionLanguageTrack,
+        presentationSize: CGSize,
         terminalPadding: TimeInterval
     ) throws -> PreparedTrack? {
         let segments = track.segments.filter {
@@ -162,12 +170,13 @@ struct Tx3gCaptionTrackWriter: Sendable {
         }
         guard !segments.isEmpty else { return nil }
 
-        let formatDescription = try makeFormatDescription()
+        let formatDescription = try makeFormatDescription(presentationSize: presentationSize)
         let input = AVAssetWriterInput(
-            mediaType: .text,
+            mediaType: .subtitle,
             outputSettings: nil,
             sourceFormatHint: formatDescription
         )
+        input.naturalSize = presentationSize
         input.expectsMediaDataInRealTime = false
         input.mediaTimeScale = 1_000
         input.mediaDataLocation = .sparselyInterleavedWithMainMediaData
@@ -207,7 +216,9 @@ struct Tx3gCaptionTrackWriter: Sendable {
         )
     }
 
-    private static func makeFormatDescription() throws -> CMFormatDescription {
+    private static func makeFormatDescription(
+        presentationSize: CGSize
+    ) throws -> CMFormatDescription {
         let transparent: [CFString: Any] = [
             kCMTextFormatDescriptionColor_Red: 0,
             kCMTextFormatDescriptionColor_Green: 0,
@@ -221,10 +232,10 @@ struct Tx3gCaptionTrackWriter: Sendable {
             kCMTextFormatDescriptionColor_Alpha: 255,
         ]
         let textBox: [CFString: Any] = [
-            kCMTextFormatDescriptionRect_Top: 0,
-            kCMTextFormatDescriptionRect_Left: 0,
-            kCMTextFormatDescriptionRect_Bottom: 0,
-            kCMTextFormatDescriptionRect_Right: 0,
+            kCMTextFormatDescriptionRect_Top: Int16(0),
+            kCMTextFormatDescriptionRect_Left: Int16(0),
+            kCMTextFormatDescriptionRect_Bottom: Int16(presentationSize.height),
+            kCMTextFormatDescriptionRect_Right: Int16(presentationSize.width),
         ]
         let style: [CFString: Any] = [
             kCMTextFormatDescriptionStyle_StartChar: 0,
@@ -247,7 +258,7 @@ struct Tx3gCaptionTrackWriter: Sendable {
         var formatDescription: CMFormatDescription?
         let status = CMFormatDescriptionCreate(
             allocator: kCFAllocatorDefault,
-            mediaType: kCMMediaType_Text,
+            mediaType: kCMMediaType_Subtitle,
             mediaSubType: kCMTextFormatType_3GText,
             extensions: extensions as CFDictionary,
             formatDescriptionOut: &formatDescription
@@ -256,6 +267,20 @@ struct Tx3gCaptionTrackWriter: Sendable {
             throw Tx3gCaptionError.cannotCreateFormatDescription(status)
         }
         return formatDescription
+    }
+
+    private static func validated(presentationSize: CGSize) throws -> CGSize {
+        let width = presentationSize.width.rounded(.up)
+        let height = presentationSize.height.rounded(.up)
+        guard width.isFinite,
+              height.isFinite,
+              width > 0,
+              height > 0,
+              width <= CGFloat(Int16.max),
+              height <= CGFloat(Int16.max) else {
+            throw Tx3gCaptionError.invalidPresentationSize
+        }
+        return CGSize(width: width, height: height)
     }
 
     private static func makeSampleBuffer(

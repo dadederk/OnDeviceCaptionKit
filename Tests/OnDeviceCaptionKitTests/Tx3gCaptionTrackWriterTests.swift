@@ -5,7 +5,7 @@ import Testing
 
 struct Tx3gCaptionTrackWriterTests {
     @available(macOS 26, *)
-    @Test("Raw tx3g samples round-trip multiple Unicode language tracks")
+    @Test("Subtitle TX3G samples round-trip as playable Unicode language tracks")
     func unicodeTracksRoundTrip() async throws {
         let outputURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("Tx3g-\(UUID().uuidString)")
@@ -27,13 +27,22 @@ struct Tx3gCaptionTrackWriterTests {
             ]
         )
 
-        try await Tx3gCaptionTrackWriter().write(tracks: [original, arabic], to: outputURL)
+        let presentationSize = CGSize(width: 1_920, height: 1_080)
+        try await Tx3gCaptionTrackWriter().write(
+            tracks: [original, arabic],
+            to: outputURL,
+            presentationSize: presentationSize
+        )
 
         let asset = AVURLAsset(url: outputURL)
-        let tracks = try await asset.loadTracks(withMediaType: .text)
+        let tracks = try await asset.loadTracks(withMediaType: .subtitle)
         #expect(tracks.count == 2)
         let tags = try await tracks.asyncMap { try await $0.load(.extendedLanguageTag) }
         #expect(Set(tags.compactMap { $0 }) == Set(["en-US", "ar-SA"]))
+        let playable = try await tracks.asyncMap { try await $0.load(.isPlayable) }
+        #expect(playable.allSatisfy { $0 })
+        let sizes = try await tracks.asyncMap { try await $0.load(.naturalSize) }
+        #expect(sizes.allSatisfy { $0 == presentationSize })
 
         let decodedTracks = try await Tx3gCaptionTrackReader().read(from: outputURL)
         let decodedByTag = Dictionary(
@@ -47,6 +56,11 @@ struct Tx3gCaptionTrackWriterTests {
             selectionGroup?.options.compactMap { $0.locale?.identifier } ?? []
         )
         #expect(optionLanguageIdentifiers.isSuperset(of: ["en-US", "ar-SA"]))
+        let authoredOptions = selectionGroup?.options.filter {
+            ["en-US", "ar-SA"].contains($0.locale?.identifier)
+        } ?? []
+        #expect(!authoredOptions.isEmpty)
+        #expect(authoredOptions.allSatisfy { $0.isPlayable })
     }
 
     @Test("Language tracks require canonical tags and monotonic timing")

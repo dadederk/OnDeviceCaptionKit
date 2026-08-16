@@ -17,7 +17,9 @@ struct Tx3gCaptionTrackReader: Sendable {
     @concurrent
     func read(from url: URL) async throws -> [CaptionLanguageTrack] {
         let asset = AVURLAsset(url: url)
-        let tracks = try await asset.loadTracks(withMediaType: .text)
+        let subtitleTracks = try await asset.loadTracks(withMediaType: .subtitle)
+        let legacyTextTracks = try await asset.loadTracks(withMediaType: .text)
+        let tracks = subtitleTracks + legacyTextTracks
         var results: [CaptionLanguageTrack] = []
         results.reserveCapacity(tracks.count)
 

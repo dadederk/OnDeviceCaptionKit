@@ -144,8 +144,9 @@ Cancelling transcription or caption export propagates `CancellationError`. Capti
 ## Caption Export Behavior
 
 - The single-language compatibility API embeds CEA-608 closed captions.
-- The multilingual API embeds Unicode `tx3g` tracks with exact extended language tags and validates them before returning.
-- Multilingual embedding authors caption-only `tx3g` tracks, then uses an AVFoundation passthrough composition to preserve compressed video and audio samples without re-encoding them.
+- The multilingual API embeds playable Unicode `tx3g` subtitle tracks with exact extended language tags and validates them before returning.
+- Multilingual embedding authors caption-only `tx3g` subtitle tracks using the source video's presentation dimensions, then uses an AVFoundation passthrough composition to preserve compressed video and audio samples without re-encoding them.
+- Validation requires exact decoded text and timing, selectable language metadata, and player-compatible subtitle tracks.
 - Empty or whitespace-only caption text is skipped.
 - Long caption text is split into row-sized CEA-608 events so AVFoundation does not silently truncate it.
 - If MOV embedding fails after transcription succeeds, `CaptionExportResult` preserves the original video URL and returns deferred SRT segments so the host app can offer a fallback file.

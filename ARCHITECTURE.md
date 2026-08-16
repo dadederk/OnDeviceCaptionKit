@@ -85,7 +85,7 @@ CaptionLanguageTrack array
    +--> Tx3gCaptionTrackWriter
            |
            v
-       Unicode text tracks
+       Playable Unicode subtitle tracks
            |
            v
        Passthrough composition with source video/audio
@@ -94,7 +94,7 @@ CaptionLanguageTrack array
        Caption alternate-group header repair
            |
            v
-       Tx3gCaptionTrackReader validation
+       TX3G payload + playback validation
 ```
 
 SRT writing owns timestamp formatting and text wrapping. MOV embedding owns CEA-608 event preparation and AVFoundation muxing.

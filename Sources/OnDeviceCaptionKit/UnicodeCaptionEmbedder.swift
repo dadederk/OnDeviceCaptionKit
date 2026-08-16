@@ -4,6 +4,8 @@ import Foundation
 @available(macOS 26, *)
 enum UnicodeCaptionEmbeddingError: Error {
     case noCaptionTracks
+    case missingVideoPresentationSize
+    case unplayableCaptionTracks(count: Int)
     case validationFailed(expected: [CaptionLanguageTrack], actual: [CaptionLanguageTrack])
 }
 
@@ -30,9 +32,15 @@ struct UnicodeCaptionEmbedder: Sendable {
         let startedAt = ContinuousClock.now
         do {
             progressHandler?(0)
+            let presentationSize = try await Self.videoPresentationSize(at: videoURL)
+            CaptionLogger.info(
+                "Starting TX3G caption staging: tracks=\(nonemptyTracks.count), "
+                    + "presentation=\(Int(presentationSize.width))x\(Int(presentationSize.height))"
+            )
             try await Tx3gCaptionTrackWriter().write(
                 tracks: nonemptyTracks,
                 to: captionTrackURL,
+                presentationSize: presentationSize,
                 terminalPadding: 0.001
             )
             try Task.checkCancellation()
@@ -60,8 +68,22 @@ struct UnicodeCaptionEmbedder: Sendable {
                     actual: decodedTracks
                 )
             }
+            let asset = AVURLAsset(url: outputURL)
+            let captionTracks = try await asset.loadTracks(withMediaType: .subtitle)
+            var unplayableTrackCount = 0
+            for track in captionTracks where try await !track.load(.isPlayable) {
+                unplayableTrackCount += 1
+            }
+            guard captionTracks.count == decodedTracks.count, unplayableTrackCount == 0 else {
+                throw UnicodeCaptionEmbeddingError.unplayableCaptionTracks(
+                    count: unplayableTrackCount
+                )
+            }
+            let decodedCueCount = decodedTracks.reduce(0) { $0 + $1.segments.count }
             CaptionLogger.info(
-                "Embedded and validated \(decodedTracks.count) Unicode caption track(s), "
+                "Embedded, decoded, and playback-validated \(decodedTracks.count) Unicode "
+                    + "subtitle track(s): playableTracks=\(captionTracks.count), "
+                    + "decodedCues=\(decodedCueCount), "
                     + "elapsed=\(Self.elapsedSeconds(since: startedAt))s"
             )
             return outputURL
@@ -88,6 +110,23 @@ struct UnicodeCaptionEmbedder: Sendable {
                 !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             }
         }
+    }
+
+    private static func videoPresentationSize(at url: URL) async throws -> CGSize {
+        let asset = AVURLAsset(url: url)
+        guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
+            throw UnicodeCaptionEmbeddingError.missingVideoPresentationSize
+        }
+        let naturalSize = try await videoTrack.load(.naturalSize)
+        let transform = try await videoTrack.load(.preferredTransform)
+        let transformed = CGRect(origin: .zero, size: naturalSize)
+            .applying(transform)
+            .standardized
+        let size = CGSize(width: transformed.width, height: transformed.height)
+        guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0 else {
+            throw UnicodeCaptionEmbeddingError.missingVideoPresentationSize
+        }
+        return size
     }
 
     private static func temporaryURL(prefix: String) -> URL {

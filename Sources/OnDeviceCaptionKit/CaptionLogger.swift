@@ -2,9 +2,12 @@ import Foundation
 import os
 
 enum CaptionLogger {
+    static let subsystem = Bundle.main.bundleIdentifier ?? "OnDeviceCaptionKit"
+    static let category = "subtitles"
+
     private static let logger = Logger(
-        subsystem: "com.accessibilityupto11.mestre.captions",
-        category: "OnDeviceCaptionKit"
+        subsystem: subsystem,
+        category: category
     )
 
     static func info(_ message: String) {
