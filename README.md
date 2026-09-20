@@ -19,7 +19,7 @@ OnDeviceCaptionKit provides:
 - Unicode `tx3g` MOV embedding with multiple selectable BCP-47 language tracks.
 - Typed errors and stable warning codes for host-app localization.
 
-v1 scope is caption generation and export only. UI, localization copy, save panels, settings, logging policy, microphone capture, screen recording, and user-facing fallback messaging stay in the consuming app.
+Current scope is caption generation and export only. UI, localization copy, save panels, settings, logging policy, microphone capture, screen recording, and user-facing fallback messaging stay in the consuming app.
 
 ## Requirements
 
@@ -35,7 +35,7 @@ Add OnDeviceCaptionKit to your `Package.swift` dependencies:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/dadederk/OnDeviceCaptionKit.git", from: "0.3.0")
+    .package(url: "https://github.com/dadederk/OnDeviceCaptionKit.git", from: "0.3.3")
 ]
 ```
 
