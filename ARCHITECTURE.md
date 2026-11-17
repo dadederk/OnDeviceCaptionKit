@@ -99,6 +99,8 @@ CaptionLanguageTrack array
 
 SRT writing owns timestamp formatting and text wrapping. MOV embedding owns CEA-608 event preparation and AVFoundation muxing.
 
+Both CEA-608 chunk-start probes and caption conversion use `CEA608CaptionConformer`. It validates numeric positive ranges and requires a range-preserving conversion before requesting AVFoundation time conformance. Short early cues without an encodable payload fail recoverably at that first conversion; requesting time conformance directly can raise an Objective-C exception. Unsupported cues retain the original video and all segments through the existing SRT fallback; cues are never silently dropped or stretched.
+
 ## Failure and Fallback Boundary
 
 ```text

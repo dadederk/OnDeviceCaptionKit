@@ -35,7 +35,7 @@ Add OnDeviceCaptionKit to your `Package.swift` dependencies:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/dadederk/OnDeviceCaptionKit.git", from: "0.3.3")
+    .package(url: "https://github.com/dadederk/OnDeviceCaptionKit.git", from: "0.3.4")
 ]
 ```
 
@@ -149,6 +149,7 @@ Cancelling transcription or caption export propagates `CancellationError`. Capti
 - Validation requires exact decoded text and timing, selectable language metadata, and player-compatible subtitle tracks.
 - Empty or whitespace-only caption text is skipped.
 - Long caption text is split into row-sized CEA-608 events so AVFoundation does not silently truncate it.
+- CEA-608 cues must be encodable within their timing constraints. Unsupported short cues fail through the structured SRT fallback instead of terminating the host process or silently changing or dropping cues.
 - If MOV embedding fails after transcription succeeds, `CaptionExportResult` preserves the original video URL and returns deferred SRT segments so the host app can offer a fallback file.
 - If multilingual MOV embedding fails, every nonempty language is returned in `deferredSRTTracks`; the package never adopts a partial track set.
 - SRT output is UTF-8, uses `HH:MM:SS,mmm` timestamps, and avoids an extra trailing blank separator.

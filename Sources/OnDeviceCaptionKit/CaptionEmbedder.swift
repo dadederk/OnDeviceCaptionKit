@@ -436,12 +436,11 @@ nonisolated final class CaptionEmbedder: Sendable {
         from captionEvents: [CaptionEvent],
         frameDuration: CMTime = CaptionEmbedder.defaultFrameDuration
     ) throws -> [AVCaption] {
-        let conformer = Self.makeCaptionConformer(frameDuration: frameDuration)
+        let conformer = try CEA608CaptionConformer(frameDuration: frameDuration)
 
         return try captionEvents.map { event in
             do {
-                let caption = AVCaption(event.text, timeRange: event.timeRange)
-                return try conformer.conformedCaption(for: caption)
+                return try conformer.conformedCaption(text: event.text, timeRange: event.timeRange)
             } catch {
                 CaptionLogger.error("Failed to conform caption to CEA-608: \(error.localizedDescription)")
                 throw CaptionEmbeddingError.captionConformanceFailed
@@ -767,17 +766,17 @@ nonisolated final class CaptionEmbedder: Sendable {
             return (.zero, [])
         }
 
-        let conformer = makeCaptionConformer(frameDuration: defaultFrameDuration)
-        let startProbe = AVCaption(
-            firstCaption.text,
-            timeRange: CMTimeRange(
-                start: defaultFrameDuration,
-                duration: firstCaption.timeRange.duration
-            )
+        let conformer = try CEA608CaptionConformer(frameDuration: defaultFrameDuration)
+        let probeRange = CMTimeRange(
+            start: defaultFrameDuration,
+            duration: firstCaption.timeRange.duration
         )
         let sourceStartTime: CMTime
         do {
-            sourceStartTime = try conformer.conformedCaption(for: startProbe).timeRange.start
+            sourceStartTime = try conformer.conformedCaption(
+                text: firstCaption.text,
+                timeRange: probeRange
+            ).timeRange.start
         } catch {
             throw CaptionEmbeddingError.captionConformanceFailed
         }
@@ -789,19 +788,6 @@ nonisolated final class CaptionEmbedder: Sendable {
             return CaptionEvent(text: caption.text, timeRange: localRange)
         }
         return (localizationOffset, localizedEvents)
-    }
-
-    private nonisolated static func makeCaptionConformer(
-        frameDuration: CMTime
-    ) -> AVCaptionFormatConformer {
-        let settings: [AVCaptionSettingsKey: Any] = [
-            .mediaType: AVMediaType.closedCaption,
-            .mediaSubType: NSNumber(value: kCMClosedCaptionFormatType_CEA608),
-            .timeCodeFrameDuration: NSValue(time: frameDuration)
-        ]
-        let conformer = AVCaptionFormatConformer(conversionSettings: settings)
-        conformer.conformsCaptionsToTimeRange = true
-        return conformer
     }
 
     private nonisolated static func captionLanguageTags(for locale: Locale) -> (languageCode: String, extendedLanguageTag: String) {

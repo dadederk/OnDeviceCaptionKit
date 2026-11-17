@@ -7,8 +7,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-11-17
+
 ### Changed
 - Unicode TX3G tracks use the generic `Sans-Serif` authored fallback family while native players remain responsible for applying system caption-appearance preferences.
+
+### Fixed
+- Prevented an AVFoundation exception for short CEA-608 cues by checking range-preserving conversion before requesting time conformance. Unsupported cues retain the source movie and complete deferred SRT output for the consuming application.
 
 ## [0.3.3] - 2026-08-16
 
